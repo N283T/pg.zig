@@ -31,31 +31,44 @@ pub fn main() !void {
     const cfg = try readEnvConfig(allocator);
     defer cfg.deinit(allocator);
 
+    // BENCH_COPY_ONLY=1 skips the (slow) exec_in_tx baseline so the
+    // binary can be wrapped by hyperfine alongside the pgx / rust-postgres
+    // benches (which only measure COPY).
+    const copy_only = std.posix.getenv("BENCH_COPY_ONLY") != null;
+
     var conn = try pg.Conn.openAndAuth(allocator, cfg.connect, cfg.auth);
     defer conn.deinit();
 
     try setupTable(&conn);
     defer dropTable(&conn) catch {};
 
-    std.debug.print(
-        "bench: pg.zig COPY vs INSERT-in-tx  (3 columns: int4, text, int8)\n",
-        .{},
-    );
-    std.debug.print(
-        "{s:<12} {s:<16} {s:>12} {s:>14} {s:>10}\n",
-        .{ "size", "strategy", "duration", "rows/sec", "relative" },
-    );
-    std.debug.print("{s}\n", .{"-" ** 70});
+    if (!copy_only) {
+        std.debug.print(
+            "bench: pg.zig COPY vs INSERT-in-tx  (3 columns: int4, text, int8)\n",
+            .{},
+        );
+        std.debug.print(
+            "{s:<12} {s:<16} {s:>12} {s:>14} {s:>10}\n",
+            .{ "size", "strategy", "duration", "rows/sec", "relative" },
+        );
+        std.debug.print("{s}\n", .{"-" ** 70});
+    }
 
     for (SIZES) |n| {
         const rows = try buildRows(allocator, n);
         defer allocator.free(rows);
 
-        // We run COPY first (it's less sensitive to warm-up noise) but
-        // print in the canonical INSERT→COPY order for the table.
         const copy_ns = try runCopy(&conn, rows);
-        const insert_ns = try runInsertInTx(&conn, rows);
+        if (copy_only) {
+            // CSV-friendly single-line format for downstream tools.
+            const ms = @as(f64, @floatFromInt(copy_ns)) / std.time.ns_per_ms;
+            const rps = @as(f64, @floatFromInt(n)) / (@as(f64, @floatFromInt(copy_ns)) / std.time.ns_per_s);
+            std.debug.print("pg.zig,{d},{d:.3},{d:.0}\n", .{ n, ms, rps });
+            continue;
+        }
 
+        // Full comparison mode: also run the slow INSERT-in-tx baseline.
+        const insert_ns = try runInsertInTx(&conn, rows);
         reportRow(n, "exec_in_tx", insert_ns, 1.0);
         reportRow(n, "copy_into", copy_ns, @as(f64, @floatFromInt(insert_ns)) / @as(f64, @floatFromInt(copy_ns)));
         std.debug.print("\n", .{});

@@ -11,3 +11,4 @@ tests/server.key
 # Cross-client benchmark build artifacts
 benchmarks/pgx_bench/pgx_bench
 benchmarks/rust_bench/target/
+benchmarks/hyperfine-results.md

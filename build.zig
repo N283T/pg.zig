@@ -107,6 +107,9 @@ pub fn build(b: *std.Build) !void {
                 },
             }),
         });
+        // Install the binary so external wrappers (bench_hyperfine.sh)
+        // can invoke it from a known location without scraping the cache.
+        b.installArtifact(bench_exe);
 
         const run_bench = b.addRunArtifact(bench_exe);
         run_bench.has_side_effects = true;
