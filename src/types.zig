@@ -1565,12 +1565,15 @@ fn compileHaltBindError(comptime T: type) noreturn {
 
 const NULL_LEN_BE = [4]u8{ 0xFF, 0xFF, 0xFF, 0xFF };
 
-/// Writes one column value in PostgreSQL COPY binary row format:
+/// Writes one column in PostgreSQL COPY binary row format:
 ///     [i32 length] [value bytes]
 /// or  [-1] (for null optionals)
 ///
-/// Reuses the same wire layout as the Bind path; the only difference is that
-/// COPY does not need a per-column format-code byte.
+/// Parallel to — but intentionally narrower than — the Bind parameter path.
+/// Only the Zig types handled in the switch below are supported; anything
+/// else triggers `@compileError`. Unlike Bind, no per-column format-code
+/// byte is written because COPY negotiates the format once in the header.
+/// Adding a new type here is independent of adding it to the Bind path.
 pub fn writeCopyValue(comptime T: type, buf: *buffer.Buffer, value: T) !void {
     const ti = @typeInfo(T);
     if (ti == .optional) {
