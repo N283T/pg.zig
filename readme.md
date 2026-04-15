@@ -434,6 +434,27 @@ supports (`bool`, `i16`/`u16`, `i32`/`u32`, `i64`/`u64`, `f32`, `f64`,
 `[]const u8`, fixed-size byte arrays, and the `?T` form for nullable
 columns). Only the **binary** wire format is supported in this version.
 
+### Benchmarks
+
+Rough single-connection COPY throughput on darwin/arm64 against a
+local PostgreSQL 16 (3 columns: `int4, text, int8`, median of 3 runs):
+
+| rows    | pg.zig   | rust-postgres | pgx      |
+|---------|---------:|--------------:|---------:|
+| 1,000   | ~500 K/s | ~380 K/s      | ~320 K/s |
+| 10,000  | ~2.9 M/s | ~2.3 M/s      | ~2.1 M/s |
+| 100,000 | ~5.3 M/s | ~4.3 M/s      | ~4.2 M/s |
+
+For comparison, the same 100,000 rows via a parameterised `exec` INSERT
+loop wrapped in a transaction gets around **9 K rows/sec** — binary
+COPY is roughly **600×** faster for bulk loading.
+
+Reproduce with `./benchmarks/bench.sh` (requires Go + Rust toolchains;
+use `./benchmarks/bench.sh zig` for just the pg.zig number). These are
+rough numbers with no warm-up or iteration averaging — run-to-run
+variance is ~10%, and real-network latency would compress all three
+drivers closer together.
+
 ## Important Notice 1 - Bind vs Read
 When you read a value, e.g. using `row.get`, the library is strict and won't help you with type conversion. If you're column is a smallint, you have to `get`
 an `i16.
