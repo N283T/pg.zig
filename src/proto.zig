@@ -2,6 +2,7 @@ pub const AuthenticationRequest = @import("proto/authentication_request.zig").Au
 pub const AuthenticationSASLContinue = @import("proto/AuthenticationSASLContinue.zig");
 pub const AuthenticationSASLFinal = @import("proto/AuthenticationSASLFinal.zig");
 pub const CommandComplete = @import("proto/CommandComplete.zig");
+pub const CopyDone = @import("proto/CopyDone.zig");
 pub const Describe = @import("proto/Describe.zig");
 pub const Error = @import("proto/Error.zig");
 pub const Execute = @import("proto/Execute.zig");
