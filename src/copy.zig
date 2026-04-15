@@ -385,3 +385,85 @@ test "copyIntoTable: auto-generated SQL inserts rows" {
 
     _ = try conn.exec("drop table copy_test_auto", .{});
 }
+
+test "CopyIn: nullable columns" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_null", .{});
+    _ = try conn.exec(
+        "create table copy_test_null (id int4 not null, label text)",
+        .{},
+    );
+
+    const Row = struct { id: i32, label: ?[]const u8 };
+    const rows = [_]Row{
+        .{ .id = 1, .label = "hi" },
+        .{ .id = 2, .label = null },
+        .{ .id = 3, .label = "ok" },
+    };
+
+    const n = try conn.copyIntoTable("copy_test_null", &rows);
+    try t.expectEqual(@as(i64, 3), n);
+
+    var result = try conn.queryOpts(
+        "select id, label from copy_test_null order by id",
+        .{},
+        .{},
+    );
+    defer result.deinit();
+
+    var i: usize = 0;
+    while (try result.next()) |row| : (i += 1) {
+        const id = try row.get(i32, 0);
+        const label = try row.get(?[]const u8, 1);
+        switch (i) {
+            0 => {
+                try t.expectEqual(@as(i32, 1), id);
+                try t.expectString("hi", label.?);
+            },
+            1 => {
+                try t.expectEqual(@as(i32, 2), id);
+                try t.expectEqual(@as(?[]const u8, null), label);
+            },
+            2 => {
+                try t.expectEqual(@as(i32, 3), id);
+                try t.expectString("ok", label.?);
+            },
+            else => unreachable,
+        }
+    }
+    try t.expectEqual(@as(usize, 3), i);
+
+    _ = try conn.exec("drop table copy_test_null", .{});
+}
+
+test "CopyIn: 100k rows triggers multiple flushes" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_big", .{});
+    _ = try conn.exec("create table copy_test_big (n int4 not null)", .{});
+
+    {
+        var copy = try conn.copyIn(
+            "copy copy_test_big (n) from stdin binary",
+            .{i32},
+        );
+        defer copy.deinit();
+        var i: i32 = 0;
+        while (i < 100_000) : (i += 1) {
+            try copy.writeRow(.{i});
+        }
+        const n = try copy.finish();
+        try t.expectEqual(@as(i64, 100_000), n);
+    }
+
+    var result = try conn.queryOpts("select count(*)::int4 from copy_test_big", .{}, .{});
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(@as(i32, 100_000), try row.get(i32, 0));
+    try t.expectEqual(null, try result.next());
+
+    _ = try conn.exec("drop table copy_test_big", .{});
+}
