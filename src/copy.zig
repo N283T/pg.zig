@@ -122,65 +122,66 @@ pub fn copyIntoTableImpl(conn: *Conn, table: []const u8, rows: anytype, opts: Co
 pub fn CopyIn(comptime ColumnTypes: anytype) type {
     return struct {
         const Self = @This();
+        const State = enum { active, done, cancelled };
 
-        conn: *Conn,
-        buf: Buffer,
-        opts: CopyOpts,
-        finished: bool,
+        _conn: *Conn,
+        _buf: Buffer,
+        _opts: CopyOpts,
+        _state: State,
 
         pub fn init(conn: *Conn, opts: CopyOpts) !Self {
             var buf = try Buffer.init(conn._allocator, @max(opts.flush_threshold, HEADER_LEN + 64));
             errdefer buf.deinit();
             try writeHeader(&buf);
             return .{
-                .conn = conn,
-                .buf = buf,
-                .opts = opts,
-                .finished = false,
+                ._conn = conn,
+                ._buf = buf,
+                ._opts = opts,
+                ._state = .active,
             };
         }
 
         pub fn writeRow(self: *Self, values: anytype) !void {
-            if (self.finished) return error.CopyInFinished;
-            try writeRowInto(ColumnTypes, &self.buf, values);
-            if (self.buf.len() >= self.opts.flush_threshold) {
+            if (self._state != .active) return error.CopyInClosed;
+            try writeRowInto(ColumnTypes, &self._buf, values);
+            if (self._buf.len() >= self._opts.flush_threshold) {
                 try self.flush();
             }
         }
 
         pub fn flush(self: *Self) !void {
-            if (self.buf.len() == 0) return;
-            const cd = proto.CopyData{ .payload = self.buf.string() };
-            self.conn._buf.reset();
-            try cd.write(&self.conn._buf);
-            try self.conn.write(self.conn._buf.string());
-            self.buf.reset();
+            if (self._buf.len() == 0) return;
+            const cd = proto.CopyData{ .payload = self._buf.string() };
+            self._conn._buf.reset();
+            try cd.write(&self._conn._buf);
+            try self._conn.write(self._conn._buf.string());
+            self._buf.reset();
         }
 
         pub fn finish(self: *Self) !i64 {
-            if (self.finished) return 0;
+            if (self._state != .active) return error.CopyInClosed;
+            // Transition eagerly so that any failure below still prevents
+            // re-entry (and stops deinit from running cancel on a half-closed
+            // flow whose endFlow defer has already fired).
+            self._state = .done;
 
-            // Ensure the reader flow opened by copyInOpts is always ended,
-            // whether we return normally or propagate an error from any of
-            // the writes below.
-            defer self.conn._reader.endFlow() catch {
-                self.conn._state = .fail;
+            defer self._conn._reader.endFlow() catch {
+                self._conn._state = .fail;
             };
 
-            try writeFooter(&self.buf);
+            try writeFooter(&self._buf);
             try self.flush();
-            self.finished = true;
 
-            self.conn._buf.reset();
+            self._conn._buf.reset();
             const done = proto.CopyDone{};
-            try done.write(&self.conn._buf);
-            try self.conn.write(self.conn._buf.string());
+            try done.write(&self._conn._buf);
+            try self._conn.write(self._conn._buf.string());
 
             var affected: ?i64 = null;
             while (true) {
-                const msg = self.conn.read() catch |err| {
+                const msg = self._conn.read() catch |err| {
                     if (err == error.PG) {
-                        self.conn.readyForQuery() catch {};
+                        self._conn.readyForQuery() catch {};
                     }
                     return err;
                 };
@@ -190,27 +191,24 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
                         affected = cc.rowsAffected();
                     },
                     'Z' => return affected orelse 0,
-                    else => return self.conn.unexpectedDBMessage(),
+                    else => return self._conn.unexpectedDBMessage(),
                 }
             }
         }
 
         pub fn cancel(self: *Self, reason: []const u8) !void {
-            if (self.finished) return;
+            if (self._state != .active) return error.CopyInClosed;
+            // Eager transition — same reasoning as finish.
+            self._state = .cancelled;
 
-            // Ensure the reader flow opened by copyInOpts is always ended,
-            // whether we drain to ReadyForQuery or propagate an error from
-            // any of the writes below.
-            defer self.conn._reader.endFlow() catch {
-                self.conn._state = .fail;
+            defer self._conn._reader.endFlow() catch {
+                self._conn._state = .fail;
             };
 
-            self.finished = true;
-
-            self.conn._buf.reset();
+            self._conn._buf.reset();
             const cf = proto.CopyFail{ .reason = reason };
-            try cf.write(&self.conn._buf);
-            try self.conn.write(self.conn._buf.string());
+            try cf.write(&self._conn._buf);
+            try self._conn.write(self._conn._buf.string());
 
             // The server is expected to emit exactly one ErrorResponse in reply to
             // CopyFail, followed by ReadyForQuery. Swallow that first error so
@@ -218,10 +216,10 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
             // caller can observe unexpected server behaviour.
             var swallowed_expected_error = false;
             while (true) {
-                const msg = self.conn.read() catch |err| {
+                const msg = self._conn.read() catch |err| {
                     if (err == error.PG and !swallowed_expected_error) {
                         // Expected: this is the server's response to our CopyFail.
-                        self.conn.err = null;
+                        self._conn.err = null;
                         swallowed_expected_error = true;
                         continue;
                     }
@@ -232,12 +230,12 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
         }
 
         pub fn deinit(self: *Self) void {
-            if (!self.finished) {
+            if (self._state == .active) {
                 self.cancel("aborted by deinit") catch {
-                    self.conn._state = .fail;
+                    self._conn._state = .fail;
                 };
             }
-            self.buf.deinit();
+            self._buf.deinit();
         }
     };
 }
@@ -689,8 +687,8 @@ test "CopyIn: writeRow after finish returns error" {
     try copy.writeRow(.{@as(i32, 1)});
     _ = try copy.finish();
 
-    // writeRow after finish should return error.CopyInFinished, not succeed silently.
-    try t.expectError(error.CopyInFinished, copy.writeRow(.{@as(i32, 2)}));
+    // writeRow after finish should return error.CopyInClosed, not succeed silently.
+    try t.expectError(error.CopyInClosed, copy.writeRow(.{@as(i32, 2)}));
 
     // Connection should still be usable (no protocol desync).
     _ = try conn.exec("select 1", .{});
@@ -726,7 +724,7 @@ test "CopyIn: Conn.exec returns ConnectionBusy while CopyIn is active" {
     _ = try conn.exec("drop table copy_test_busy", .{});
 }
 
-test "CopyIn: finish called twice returns 0 on the second call" {
+test "CopyIn: finish after finish returns error.CopyInClosed" {
     var conn = t.connect(.{});
     defer conn.deinit();
 
@@ -742,13 +740,56 @@ test "CopyIn: finish called twice returns 0 on the second call" {
     const first = try copy.finish();
     try t.expectEqual(@as(i64, 1), first);
 
-    // Second finish should short-circuit to 0, no wire traffic.
-    const second = try copy.finish();
-    try t.expectEqual(@as(i64, 0), second);
+    // Second finish must fail loudly rather than silently returning 0.
+    try t.expectError(error.CopyInClosed, copy.finish());
 
     // Conn must still be usable.
     _ = try conn.exec("select 1", .{});
     _ = try conn.exec("drop table copy_test_finish_twice", .{});
+}
+
+test "CopyIn: cancel after finish returns error.CopyInClosed" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_cancel_after_finish", .{});
+    _ = try conn.exec("create table copy_test_cancel_after_finish (n int4 not null)", .{});
+
+    var copy = try conn.copyIn(
+        "copy copy_test_cancel_after_finish (n) from stdin binary",
+        .{i32},
+    );
+    defer copy.deinit();
+    try copy.writeRow(.{@as(i32, 1)});
+    _ = try copy.finish();
+
+    // cancel after a successful finish should error, not silently no-op.
+    try t.expectError(error.CopyInClosed, copy.cancel("too late"));
+
+    _ = try conn.exec("select 1", .{});
+    _ = try conn.exec("drop table copy_test_cancel_after_finish", .{});
+}
+
+test "CopyIn: finish after cancel returns error.CopyInClosed" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_finish_after_cancel", .{});
+    _ = try conn.exec("create table copy_test_finish_after_cancel (n int4 not null)", .{});
+
+    var copy = try conn.copyIn(
+        "copy copy_test_finish_after_cancel (n) from stdin binary",
+        .{i32},
+    );
+    defer copy.deinit();
+    try copy.writeRow(.{@as(i32, 1)});
+    try copy.cancel("user cancel");
+
+    // finish after a successful cancel should error, not silently return 0.
+    try t.expectError(error.CopyInClosed, copy.finish());
+
+    _ = try conn.exec("select 1", .{});
+    _ = try conn.exec("drop table copy_test_finish_after_cancel", .{});
 }
 
 test "CopyIn: text-mode COPY rejected with UnexpectedDBMessage" {
