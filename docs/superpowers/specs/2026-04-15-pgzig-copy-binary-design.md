@@ -283,8 +283,6 @@ shaped this way, only visibility / re-exports change.
 
 ### 6.2 Supported Zig types in v1
 
-The set inherits from whatever the Bind path supports today:
-
 | Zig type | PG type | Notes |
 |---|---|---|
 | `bool` | bool | 1 byte (0 / 1) |
@@ -293,22 +291,31 @@ The set inherits from whatever the Bind path supports today:
 | `i64` / `u64` | int8 | 8 bytes BE |
 | `f32` | float4 | 4 bytes BE |
 | `f64` | float8 | 8 bytes BE |
-| `[]const u8`, `[N]u8` | text / bytea / uuid | bytes verbatim |
+| `[]const u8`, `[]u8` | text / bytea / varchar | bytes verbatim (length prefix + payload) |
+| `[N]u8` | uuid / fixed bytea | fixed-size byte array |
 | `?T` | nullable | length `-1` for null, otherwise `T`'s encoding |
-| `[]const T` | array | existing array encoder |
-| `Numeric` | numeric | existing |
-| `Cidr` | cidr / inet | existing |
-| user struct with `pgEncode` | custom | existing convention |
 
-Anything the Bind path does not yet support is also unsupported by COPY,
-and produces a compile-time error from `encodeBinary`.
+Anything not in this table is unsupported by `writeCopyValue` and
+produces a compile-time error.
 
-### 6.3 NULL handling
+### 6.3 Deferred to follow-up
+
+- `[]const T` (arrays of scalar types)
+- `Numeric` (arbitrary-precision decimals)
+- `Cidr` / `Inet` (network types)
+- User structs with custom `pgEncode`
+
+These types are encoded by the Bind path today but not by
+`writeCopyValue`. Adding them is mechanical (one additional `switch` arm
+per type in `writeCopyValue`) and can land as follow-up PRs once v1
+ships.
+
+### 6.4 NULL handling
 
 The Bind path's `?T` convention is reused: a null optional writes
 `i32 -1` and no value bytes. Non-optional `T` always writes a value.
 
-### 6.4 Compile-time expansion
+### 6.5 Compile-time expansion
 
 `writeRow` is `inline for`-unrolled across `ColumnTypes`, so the per-row
 hot path is a straight-line sequence of buffer writes with no runtime
