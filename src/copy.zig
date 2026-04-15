@@ -211,12 +211,17 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
             try cf.write(&self.conn._buf);
             try self.conn.write(self.conn._buf.string());
 
+            // The server is expected to emit exactly one ErrorResponse in reply to
+            // CopyFail, followed by ReadyForQuery. Swallow that first error so
+            // cancel() returns cleanly, but surface any additional errors so the
+            // caller can observe unexpected server behaviour.
+            var swallowed_expected_error = false;
             while (true) {
                 const msg = self.conn.read() catch |err| {
-                    if (err == error.PG) {
-                        // The error message that the server emits in response to
-                        // CopyFail is expected — clear it and keep draining.
+                    if (err == error.PG and !swallowed_expected_error) {
+                        // Expected: this is the server's response to our CopyFail.
                         self.conn.err = null;
+                        swallowed_expected_error = true;
                         continue;
                     }
                     return err;
