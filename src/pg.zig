@@ -10,6 +10,8 @@ pub const Iterator = lib.Iterator;
 pub const QueryRow = lib.QueryRow;
 pub const Mapper = lib.Mapper;
 pub const Binary = lib.Binary;
+pub const CopyIn = lib.CopyIn;
+pub const CopyOpts = lib.CopyOpts;
 
 pub const Listener = @import("listener.zig").Listener;
 

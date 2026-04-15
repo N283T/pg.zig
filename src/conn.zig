@@ -73,6 +73,9 @@ pub const Conn = struct {
 
         // we're in a transaction
         transaction,
+
+        // we're in a COPY ... FROM STDIN flow
+        copy_in,
     };
 
     pub const Opts = struct {
@@ -407,6 +410,76 @@ pub const Conn = struct {
                 else => return self.unexpectedDBMessage(),
             }
         }
+    }
+
+    pub fn copyIn(self: *Conn, sql: []const u8, comptime ColumnTypes: anytype) !lib.copy.CopyIn(ColumnTypes) {
+        return self.copyInOpts(sql, ColumnTypes, .{});
+    }
+
+    pub fn copyInOpts(
+        self: *Conn,
+        sql: []const u8,
+        comptime ColumnTypes: anytype,
+        opts: lib.copy.CopyOpts,
+    ) !lib.copy.CopyIn(ColumnTypes) {
+        if (self.canQuery() == false) return error.ConnectionBusy;
+
+        var buf = &self._buf;
+        buf.reset();
+
+        // Open a read flow so any large CopyInResponse / Error payloads can be
+        // assembled. Use the conn's default allocator and no per-op timeout.
+        try self._reader.startFlow(null, null);
+        errdefer self._reader.endFlow() catch {
+            self._state = .fail;
+        };
+
+        const q = proto.Query{ .sql = sql };
+        try q.write(buf);
+        self._state = .copy_in;
+        try self.write(buf.string());
+
+        // Expect CopyInResponse 'G' or Error 'E' (handled inside Conn.read by setErr).
+        while (true) {
+            const msg = self.read() catch |err| {
+                if (err == error.PG) self.readyForQuery() catch {};
+                return err;
+            };
+            switch (msg.type) {
+                'G' => {
+                    // Payload byte 0 is the overall format: 0=text, 1=binary.
+                    // We always send BINARY, so anything else is a protocol error.
+                    if (msg.data.len < 1 or msg.data[0] != 1) {
+                        self._state = .fail;
+                        return error.UnexpectedDBMessage;
+                    }
+                    return lib.copy.CopyIn(ColumnTypes).init(self, opts) catch |err| {
+                        // init allocates a Buffer + writes the header; on failure the
+                        // server is still in COPY mode and we've transitioned to
+                        // .copy_in. Drop to .fail so the pool disposes the conn.
+                        self._state = .fail;
+                        return err;
+                    };
+                },
+                else => return self.unexpectedDBMessage(),
+            }
+        }
+    }
+
+    pub fn copyInto(self: *Conn, sql: []const u8, rows: anytype) !i64 {
+        return lib.copy.copyIntoImpl(self, sql, rows, .{});
+    }
+
+    pub fn copyIntoOpts(self: *Conn, sql: []const u8, rows: anytype, opts: lib.copy.CopyOpts) !i64 {
+        return lib.copy.copyIntoImpl(self, sql, rows, opts);
+    }
+
+    pub fn copyIntoTable(self: *Conn, table: []const u8, rows: anytype) !i64 {
+        return lib.copy.copyIntoTableImpl(self, table, rows, .{});
+    }
+
+    pub fn copyIntoTableOpts(self: *Conn, table: []const u8, rows: anytype, opts: lib.copy.CopyOpts) !i64 {
+        return lib.copy.copyIntoTableImpl(self, table, rows, opts);
     }
 
     pub fn begin(self: *Conn) !void {

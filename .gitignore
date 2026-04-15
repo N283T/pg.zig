@@ -1,4 +1,9 @@
+zig-cache/
 zig-out/
 .zig-cache/
-tests/server.key
+
+# Local test PostgreSQL (managed by tests/run-pg.sh)
+tests/pgdata/
+tests/pg.log
 tests/server.crt
+tests/server.key
