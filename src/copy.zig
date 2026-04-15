@@ -533,3 +533,98 @@ test "CopyIn: zero rows returns 0 affected" {
 
     _ = try conn.exec("drop table copy_test_empty", .{});
 }
+
+test "CopyIn: error at start when table missing leaves connection usable" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_missing", .{});
+
+    const r = conn.copyIn(
+        "copy copy_test_missing (n) from stdin binary",
+        .{i32},
+    );
+    try t.expectError(error.PG, r);
+    try t.expectEqual(false, conn.err == null);
+
+    // Connection should be usable for a follow-up query.
+    _ = try conn.exec("select 1", .{});
+}
+
+test "CopyIn: NOT NULL violation surfaces at finish" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_null_violation", .{});
+    _ = try conn.exec(
+        "create table copy_test_null_violation (id int4 not null, name text not null)",
+        .{},
+    );
+
+    {
+        var copy = try conn.copyIn(
+            "copy copy_test_null_violation (id, name) from stdin binary",
+            .{ i32, ?[]const u8 },
+        );
+        defer copy.deinit();
+        try copy.writeRow(.{ @as(i32, 1), null });
+        try t.expectError(error.PG, copy.finish());
+    }
+
+    _ = try conn.exec("select 1", .{});
+    _ = try conn.exec("drop table copy_test_null_violation", .{});
+}
+
+test "CopyIn: cancel rolls back the in-flight COPY" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_cancel", .{});
+    _ = try conn.exec("create table copy_test_cancel (id int4 not null)", .{});
+
+    {
+        var copy = try conn.copyIn(
+            "copy copy_test_cancel (id) from stdin binary",
+            .{i32},
+        );
+        defer copy.deinit();
+        try copy.writeRow(.{@as(i32, 1)});
+        try copy.writeRow(.{@as(i32, 2)});
+        try copy.cancel("test cancel");
+    }
+
+    _ = try conn.exec("select 1", .{});
+    var result = try conn.queryOpts("select count(*)::int4 from copy_test_cancel", .{}, .{});
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(@as(i32, 0), try row.get(i32, 0));
+    _ = try result.next();
+
+    _ = try conn.exec("drop table copy_test_cancel", .{});
+}
+
+test "CopyIn: deinit without finish auto-cancels and connection is reusable" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_autocancel", .{});
+    _ = try conn.exec("create table copy_test_autocancel (id int4 not null)", .{});
+
+    {
+        var copy = try conn.copyIn(
+            "copy copy_test_autocancel (id) from stdin binary",
+            .{i32},
+        );
+        try copy.writeRow(.{@as(i32, 99)});
+        copy.deinit();
+    }
+
+    _ = try conn.exec("select 1", .{});
+    var result = try conn.queryOpts("select count(*)::int4 from copy_test_autocancel", .{}, .{});
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(@as(i32, 0), try row.get(i32, 0));
+    _ = try result.next();
+
+    _ = try conn.exec("drop table copy_test_autocancel", .{});
+}
