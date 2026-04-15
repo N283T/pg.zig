@@ -1563,6 +1563,96 @@ fn compileHaltBindError(comptime T: type) noreturn {
     @compileError("cannot bind value of type " ++ @typeName(T));
 }
 
+const NULL_LEN_BE = [4]u8{ 0xFF, 0xFF, 0xFF, 0xFF };
+
+/// Writes one column value in PostgreSQL COPY binary row format:
+///     [i32 length] [value bytes]
+/// or  [-1] (for null optionals)
+///
+/// Reuses the same wire layout as the Bind path; the only difference is that
+/// COPY does not need a per-column format-code byte.
+pub fn writeCopyValue(comptime T: type, buf: *buffer.Buffer, value: T) !void {
+    const ti = @typeInfo(T);
+    if (ti == .optional) {
+        if (value) |v| {
+            return writeCopyValue(ti.optional.child, buf, v);
+        }
+        try buf.write(&NULL_LEN_BE);
+        return;
+    }
+
+    // Primitives
+    switch (T) {
+        bool => {
+            try buf.write(&.{ 0, 0, 0, 1 });
+            try buf.writeByte(if (value) 1 else 0);
+            return;
+        },
+        i16 => {
+            try buf.write(&.{ 0, 0, 0, 2 });
+            try buf.writeIntBig(i16, value);
+            return;
+        },
+        u16 => {
+            if (value > 32767) return error.UnsignedIntWouldBeTruncated;
+            try buf.write(&.{ 0, 0, 0, 2 });
+            try buf.writeIntBig(i16, @intCast(value));
+            return;
+        },
+        i32 => {
+            try buf.write(&.{ 0, 0, 0, 4 });
+            try buf.writeIntBig(i32, value);
+            return;
+        },
+        u32 => {
+            if (value > 2147483647) return error.UnsignedIntWouldBeTruncated;
+            try buf.write(&.{ 0, 0, 0, 4 });
+            try buf.writeIntBig(i32, @intCast(value));
+            return;
+        },
+        i64 => {
+            try buf.write(&.{ 0, 0, 0, 8 });
+            try buf.writeIntBig(i64, value);
+            return;
+        },
+        u64 => {
+            if (value > 9223372036854775807) return error.UnsignedIntWouldBeTruncated;
+            try buf.write(&.{ 0, 0, 0, 8 });
+            try buf.writeIntBig(i64, @intCast(value));
+            return;
+        },
+        f32 => {
+            try buf.write(&.{ 0, 0, 0, 4 });
+            const tmp: *const i32 = @ptrCast(&value);
+            try buf.writeIntBig(i32, tmp.*);
+            return;
+        },
+        f64 => {
+            try buf.write(&.{ 0, 0, 0, 8 });
+            const tmp: *const i64 = @ptrCast(&value);
+            try buf.writeIntBig(i64, tmp.*);
+            return;
+        },
+        []const u8, []u8 => {
+            var view = try buf.skip(4 + value.len);
+            view.writeIntBig(i32, @intCast(value.len));
+            view.write(value);
+            return;
+        },
+        else => {},
+    }
+
+    // Fixed-size byte arrays (e.g. uuid as [16]u8)
+    if (ti == .array and ti.array.child == u8) {
+        var view = try buf.skip(4 + value.len);
+        view.writeIntBig(i32, @intCast(value.len));
+        view.write(&value);
+        return;
+    }
+
+    @compileError("writeCopyValue: unsupported type " ++ @typeName(T));
+}
+
 const t = lib.testing;
 test "UUID: toString" {
     try t.expectError(error.InvalidUUID, UUID.toString(&.{ 73, 190, 142, 9, 170, 250, 176, 16, 73, 21 }));
@@ -1583,4 +1673,64 @@ test "UUID: toBytes" {
         const s = try UUID.toBytes("166b4751-d702-4fb9-9a2a-cd6b69ed18d7");
         try t.expectSlice(u8, &.{ 22, 107, 71, 81, 215, 2, 79, 185, 154, 42, 205, 107, 105, 237, 24, 215 }, &s);
     }
+}
+
+test "writeCopyValue: i32" {
+    var buf = try buffer.Buffer.init(std.testing.allocator, 64);
+    defer buf.deinit();
+
+    try writeCopyValue(i32, &buf, 42);
+
+    const out = buf.string();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 4, 0, 0, 0, 42 }, out);
+}
+
+test "writeCopyValue: optional i32 null" {
+    var buf = try buffer.Buffer.init(std.testing.allocator, 64);
+    defer buf.deinit();
+
+    try writeCopyValue(?i32, &buf, null);
+
+    const out = buf.string();
+    try std.testing.expectEqualSlices(u8, &.{ 0xFF, 0xFF, 0xFF, 0xFF }, out);
+}
+
+test "writeCopyValue: optional i32 some" {
+    var buf = try buffer.Buffer.init(std.testing.allocator, 64);
+    defer buf.deinit();
+
+    try writeCopyValue(?i32, &buf, 7);
+
+    const out = buf.string();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 4, 0, 0, 0, 7 }, out);
+}
+
+test "writeCopyValue: []const u8" {
+    var buf = try buffer.Buffer.init(std.testing.allocator, 64);
+    defer buf.deinit();
+
+    try writeCopyValue([]const u8, &buf, "hi");
+
+    const out = buf.string();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 2, 'h', 'i' }, out);
+}
+
+test "writeCopyValue: bool" {
+    var buf = try buffer.Buffer.init(std.testing.allocator, 64);
+    defer buf.deinit();
+
+    try writeCopyValue(bool, &buf, true);
+
+    const out = buf.string();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 1 }, out);
+}
+
+test "writeCopyValue: i64" {
+    var buf = try buffer.Buffer.init(std.testing.allocator, 64);
+    defer buf.deinit();
+
+    try writeCopyValue(i64, &buf, 0x0102030405060708);
+
+    const out = buf.string();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8 }, out);
 }
