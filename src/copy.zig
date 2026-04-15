@@ -181,3 +181,56 @@ test "CopyIn footer is i16 -1" {
 
     try std.testing.expectEqualSlices(u8, &.{ 0xFF, 0xFF }, buf.string());
 }
+
+test "CopyIn: happy path inserts rows" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_basic", .{});
+    _ = try conn.exec(
+        "create table copy_test_basic (id int4 not null, name text not null)",
+        .{},
+    );
+
+    {
+        var copy = try conn.copyIn(
+            "copy copy_test_basic (id, name) from stdin binary",
+            .{ i32, []const u8 },
+        );
+        defer copy.deinit();
+        try copy.writeRow(.{ @as(i32, 1), "alice" });
+        try copy.writeRow(.{ @as(i32, 2), "bob" });
+        try copy.writeRow(.{ @as(i32, 3), "carol" });
+        const n = try copy.finish();
+        try t.expectEqual(@as(i64, 3), n);
+    }
+
+    var result = try conn.queryOpts(
+        "select id, name from copy_test_basic order by id",
+        .{},
+        .{},
+    );
+    defer result.deinit();
+
+    var i: usize = 0;
+    while (try result.next()) |row| : (i += 1) {
+        switch (i) {
+            0 => {
+                try t.expectEqual(@as(i32, 1), try row.get(i32, 0));
+                try t.expectString("alice", try row.get([]const u8, 1));
+            },
+            1 => {
+                try t.expectEqual(@as(i32, 2), try row.get(i32, 0));
+                try t.expectString("bob", try row.get([]const u8, 1));
+            },
+            2 => {
+                try t.expectEqual(@as(i32, 3), try row.get(i32, 0));
+                try t.expectString("carol", try row.get([]const u8, 1));
+            },
+            else => unreachable,
+        }
+    }
+    try t.expectEqual(@as(usize, 3), i);
+
+    _ = try conn.exec("drop table copy_test_basic", .{});
+}
