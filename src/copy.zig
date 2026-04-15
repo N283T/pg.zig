@@ -628,3 +628,27 @@ test "CopyIn: deinit without finish auto-cancels and connection is reusable" {
 
     _ = try conn.exec("drop table copy_test_autocancel", .{});
 }
+
+test "CopyIn: inside transaction, ROLLBACK discards rows" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_tx", .{});
+    _ = try conn.exec("create table copy_test_tx (id int4 not null)", .{});
+
+    try conn.begin();
+
+    const Row = struct { id: i32 };
+    const rows = [_]Row{ .{ .id = 1 }, .{ .id = 2 } };
+    _ = try conn.copyIntoTable("copy_test_tx", &rows);
+
+    try conn.rollback();
+
+    var result = try conn.queryOpts("select count(*)::int4 from copy_test_tx", .{}, .{});
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(@as(i32, 0), try row.get(i32, 0));
+    _ = try result.next();
+
+    _ = try conn.exec("drop table copy_test_tx", .{});
+}
