@@ -141,6 +141,7 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
         }
 
         pub fn writeRow(self: *Self, values: anytype) !void {
+            if (self.finished) return error.CopyInFinished;
             try writeRowInto(ColumnTypes, &self.buf, values);
             if (self.buf.len() >= self.opts.flush_threshold) {
                 try self.flush();
@@ -671,4 +672,27 @@ test "CopyIn: inside transaction, ROLLBACK discards rows" {
     _ = try result.next();
 
     _ = try conn.exec("drop table copy_test_tx", .{});
+}
+
+test "CopyIn: writeRow after finish returns error" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_after_finish", .{});
+    _ = try conn.exec("create table copy_test_after_finish (n int4 not null)", .{});
+
+    var copy = try conn.copyIn(
+        "copy copy_test_after_finish (n) from stdin binary",
+        .{i32},
+    );
+    defer copy.deinit();
+    try copy.writeRow(.{@as(i32, 1)});
+    _ = try copy.finish();
+
+    // writeRow after finish should return error.CopyInFinished, not succeed silently.
+    try t.expectError(error.CopyInFinished, copy.writeRow(.{@as(i32, 2)}));
+
+    // Connection should still be usable (no protocol desync).
+    _ = try conn.exec("select 1", .{});
+    _ = try conn.exec("drop table copy_test_after_finish", .{});
 }
