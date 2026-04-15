@@ -89,4 +89,30 @@ pub fn build(b: *std.Build) !void {
         const test_step = b.step("test", "Run unit tests");
         test_step.dependOn(&run_test.step);
     }
+
+    {
+        // bench step: build + run benchmarks/copy_bench.zig against the
+        // local PG started via tests/run-pg.sh (or any PG reachable via
+        // PGHOST/PGPORT/PGUSER/PGDATABASE/PGPASSWORD). Meaningful only in
+        // a release-mode build, e.g.:
+        //   zig build bench -Doptimize=ReleaseFast
+        const bench_exe = b.addExecutable(.{
+            .name = "copy_bench",
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .root_source_file = b.path("benchmarks/copy_bench.zig"),
+                .imports = &.{
+                    .{ .name = "pg", .module = pg_module },
+                },
+            }),
+        });
+
+        const run_bench = b.addRunArtifact(bench_exe);
+        run_bench.has_side_effects = true;
+        if (b.args) |args| run_bench.addArgs(args);
+
+        const bench_step = b.step("bench", "Run COPY vs INSERT benchmark");
+        bench_step.dependOn(&run_bench.step);
+    }
 }
