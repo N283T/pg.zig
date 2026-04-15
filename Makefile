@@ -4,6 +4,10 @@ F=
 t:
 	TEST_FILTER="${F}" zig build test --summary all -freference-trace
 
+.PHONY: b
+b:
+	zig build bench -Doptimize=ReleaseFast
+
 .PHONY: d
 d:
 	cd tests && docker compose up
