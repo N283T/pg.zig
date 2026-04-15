@@ -80,6 +80,45 @@ pub fn copyIntoImpl(conn: *Conn, sql: []const u8, rows: anytype, opts: CopyOpts)
     return copy.finish();
 }
 
+fn buildCopySql(allocator: Allocator, table: []const u8, comptime Row: type) ![]u8 {
+    const fields = std.meta.fields(Row);
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+
+    try list.print(allocator, "copy \"{s}\" (", .{table});
+    inline for (fields, 0..) |f, i| {
+        if (i > 0) try list.appendSlice(allocator, ", ");
+        try list.print(allocator, "\"{s}\"", .{f.name});
+    }
+    try list.appendSlice(allocator, ") from stdin binary");
+    return list.toOwnedSlice(allocator);
+}
+
+pub fn copyIntoTableImpl(conn: *Conn, table: []const u8, rows: anytype, opts: CopyOpts) !i64 {
+    const Slice = @TypeOf(rows);
+    const Row = comptime blk: {
+        const ti = @typeInfo(Slice);
+        switch (ti) {
+            .pointer => |p| {
+                if (p.size == .slice or p.size == .many) break :blk p.child;
+                if (p.size == .one) {
+                    const inner = @typeInfo(p.child);
+                    if (inner == .array) break :blk inner.array.child;
+                }
+            },
+            .array => |a| break :blk a.child,
+            else => {},
+        }
+        @compileError("copyIntoTable expects a slice or array of structs, got " ++ @typeName(Slice));
+    };
+
+    const allocator = conn._allocator;
+    const sql = try buildCopySql(allocator, table, Row);
+    defer allocator.free(sql);
+
+    return copyIntoImpl(conn, sql, rows, opts);
+}
+
 pub fn CopyIn(comptime ColumnTypes: anytype) type {
     return struct {
         const Self = @This();
@@ -306,4 +345,43 @@ test "copyInto: struct slice helper" {
     try t.expectEqual(null, try result.next());
 
     _ = try conn.exec("drop table copy_test_into", .{});
+}
+
+test "buildCopySql: quotes table and column names" {
+    const Row = struct { id: i32, name: []const u8, created_at: i64 };
+    const sql = try buildCopySql(t.allocator, "users", Row);
+    defer t.allocator.free(sql);
+
+    try t.expectString(
+        "copy \"users\" (\"id\", \"name\", \"created_at\") from stdin binary",
+        sql,
+    );
+}
+
+test "copyIntoTable: auto-generated SQL inserts rows" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_auto", .{});
+    _ = try conn.exec(
+        "create table copy_test_auto (id int4 not null, name text not null)",
+        .{},
+    );
+
+    const Row = struct { id: i32, name: []const u8 };
+    const rows = [_]Row{
+        .{ .id = 100, .name = "p" },
+        .{ .id = 200, .name = "q" },
+    };
+
+    const n = try conn.copyIntoTable("copy_test_auto", &rows);
+    try t.expectEqual(@as(i64, 2), n);
+
+    var result = try conn.queryOpts("select count(*)::int4 from copy_test_auto", .{}, .{});
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(@as(i32, 2), try row.get(i32, 0));
+    try t.expectEqual(null, try result.next());
+
+    _ = try conn.exec("drop table copy_test_auto", .{});
 }
