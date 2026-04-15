@@ -427,6 +427,8 @@ exceeds 64 KiB (configurable via `copyInOpts(..., .{ .flush_threshold = N })`).
 Forgetting to call `finish` causes `deinit` to send `CopyFail`, which
 PostgreSQL treats as an abort — no rows are committed.
 
+`copyIntoTable` wraps the table name and each field name in double quotes, but it does NOT escape any `"` inside them. Pass `table` as a literal or pre-sanitize it — do not interpolate unchecked user input here. For dynamic schema/table selection, prefer `copyInto` with a caller-constructed SQL string.
+
 Supported column types are the same primitive set the parameter-bind path
 supports (`bool`, `i16`/`u16`, `i32`/`u32`, `i64`/`u64`, `f32`, `f64`,
 `[]const u8`, fixed-size byte arrays, and the `?T` form for nullable
