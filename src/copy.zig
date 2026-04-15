@@ -34,6 +34,10 @@ fn writeRowInto(comptime ColumnTypes: anytype, buf: *Buffer, values: anytype) !v
     }
 }
 
+fn writeFooter(buf: *Buffer) !void {
+    try buf.writeIntBig(i16, -1);
+}
+
 pub fn CopyIn(comptime ColumnTypes: anytype) type {
     return struct {
         const Self = @This();
@@ -72,11 +76,67 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
             self.buf.reset();
         }
 
-        pub fn deinit(self: *Self) void {
-            self.buf.deinit();
+        pub fn finish(self: *Self) !i64 {
+            if (self.finished) return 0;
+            try writeFooter(&self.buf);
+            try self.flush();
+            self.finished = true;
+
+            self.conn._buf.reset();
+            const done = proto.CopyDone{};
+            try done.write(&self.conn._buf);
+            try self.conn.write(self.conn._buf.string());
+
+            var affected: ?i64 = null;
+            while (true) {
+                const msg = self.conn.read() catch |err| {
+                    if (err == error.PG) {
+                        self.conn.readyForQuery() catch {};
+                    }
+                    return err;
+                };
+                switch (msg.type) {
+                    'C' => {
+                        const cc = try proto.CommandComplete.parse(msg.data);
+                        affected = cc.rowsAffected();
+                    },
+                    'Z' => return affected orelse 0,
+                    else => return self.conn.unexpectedDBMessage(),
+                }
+            }
         }
 
-        // Other methods (finish, cancel) land in later tasks.
+        pub fn cancel(self: *Self, reason: []const u8) !void {
+            if (self.finished) return;
+            self.finished = true;
+
+            self.conn._buf.reset();
+            const cf = proto.CopyFail{ .reason = reason };
+            try cf.write(&self.conn._buf);
+            try self.conn.write(self.conn._buf.string());
+
+            while (true) {
+                const msg = self.conn.read() catch |err| {
+                    if (err == error.PG) {
+                        // The error message that the server emits in response to
+                        // CopyFail is expected — clear it and keep draining.
+                        self.conn.err = null;
+                        continue;
+                    }
+                    return err;
+                };
+                if (msg.type == 'Z') return;
+            }
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (!self.finished) {
+                self.cancel("aborted by deinit") catch {
+                    self.conn._state = .fail;
+                };
+            }
+            self.buf.deinit();
+        }
     };
 }
 
@@ -111,4 +171,13 @@ test "CopyIn.writeRow: header + one row of (i32, []const u8)" {
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 2, 'a', 'b' }, out[29..35]);
 
     buf.deinit();
+}
+
+test "CopyIn footer is i16 -1" {
+    var buf = try Buffer.init(t.allocator, 32);
+    defer buf.deinit();
+
+    try writeFooter(&buf);
+
+    try std.testing.expectEqualSlices(u8, &.{ 0xFF, 0xFF }, buf.string());
 }
