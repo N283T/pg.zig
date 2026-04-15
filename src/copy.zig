@@ -168,6 +168,12 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
             try done.write(&self.conn._buf);
             try self.conn.write(self.conn._buf.string());
 
+            // Ensure the reader flow opened by copyInOpts is always ended,
+            // whether we return normally or propagate an error.
+            defer self.conn._reader.endFlow() catch {
+                self.conn._state = .fail;
+            };
+
             var affected: ?i64 = null;
             while (true) {
                 const msg = self.conn.read() catch |err| {
@@ -195,6 +201,12 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
             const cf = proto.CopyFail{ .reason = reason };
             try cf.write(&self.conn._buf);
             try self.conn.write(self.conn._buf.string());
+
+            // Ensure the reader flow opened by copyInOpts is always ended,
+            // whether we drain to ReadyForQuery or propagate an error.
+            defer self.conn._reader.endFlow() catch {
+                self.conn._state = .fail;
+            };
 
             while (true) {
                 const msg = self.conn.read() catch |err| {
