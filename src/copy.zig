@@ -14,6 +14,26 @@ pub const CopyOpts = struct {
 const MAGIC = "PGCOPY\n\xFF\r\n\x00";
 pub const HEADER_LEN: usize = MAGIC.len + 4 + 4; // 11 + 4 (flags) + 4 (header ext) = 19
 
+fn writeHeader(buf: *Buffer) !void {
+    try buf.ensureUnusedCapacity(HEADER_LEN);
+    try buf.write(MAGIC);
+    try buf.write(&.{ 0, 0, 0, 0 }); // flags
+    try buf.write(&.{ 0, 0, 0, 0 }); // header extension length
+}
+
+fn writeRowInto(comptime ColumnTypes: anytype, buf: *Buffer, values: anytype) !void {
+    if (values.len != ColumnTypes.len) {
+        @compileError(std.fmt.comptimePrint(
+            "expected {d} values, got {d}",
+            .{ ColumnTypes.len, values.len },
+        ));
+    }
+    try buf.writeIntBig(i16, @intCast(ColumnTypes.len));
+    inline for (ColumnTypes, 0..) |T, i| {
+        try types.writeCopyValue(T, buf, values[i]);
+    }
+}
+
 pub fn CopyIn(comptime ColumnTypes: anytype) type {
     return struct {
         const Self = @This();
@@ -24,11 +44,39 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
         opts: CopyOpts,
         finished: bool,
 
+        pub fn init(conn: *Conn, opts: CopyOpts) !Self {
+            var buf = try Buffer.init(conn._allocator, @max(opts.flush_threshold, HEADER_LEN + 64));
+            errdefer buf.deinit();
+            try writeHeader(&buf);
+            return .{
+                .conn = conn,
+                .buf = buf,
+                .opts = opts,
+                .finished = false,
+            };
+        }
+
+        pub fn writeRow(self: *Self, values: anytype) !void {
+            try writeRowInto(ColumnTypes, &self.buf, values);
+            if (self.buf.len() >= self.opts.flush_threshold) {
+                try self.flush();
+            }
+        }
+
+        pub fn flush(self: *Self) !void {
+            if (self.buf.len() == 0) return;
+            const cd = proto.CopyData{ .payload = self.buf.string() };
+            self.conn._buf.reset();
+            try cd.write(&self.conn._buf);
+            try self.conn.write(self.conn._buf.string());
+            self.buf.reset();
+        }
+
         pub fn deinit(self: *Self) void {
             self.buf.deinit();
         }
 
-        // Other methods (init, writeRow, flush, finish, cancel) land in later tasks.
+        // Other methods (finish, cancel) land in later tasks.
     };
 }
 
@@ -36,4 +84,31 @@ const t = lib.testing;
 test "copy: header bytes are exactly 19 bytes with PGCOPY magic" {
     try t.expectEqual(@as(usize, 19), HEADER_LEN);
     try t.expectString("PGCOPY\n\xFF\r\n\x00", MAGIC);
+}
+
+test "CopyIn.writeRow: header + one row of (i32, []const u8)" {
+    var buf = try Buffer.init(t.allocator, 64);
+    errdefer buf.deinit();
+
+    try writeHeader(&buf);
+
+    const Cols = .{ i32, []const u8 };
+    try writeRowInto(Cols, &buf, .{ 7, "ab" });
+
+    const out = buf.string();
+
+    // 19 header bytes
+    try std.testing.expectEqualSlices(u8, "PGCOPY\n\xFF\r\n\x00" ++ &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }, out[0..19]);
+
+    // i16 num_cols = 2
+    try t.expectEqual(@as(u8, 0), out[19]);
+    try t.expectEqual(@as(u8, 2), out[20]);
+
+    // col 0: i32 length=4, value 7
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 4, 0, 0, 0, 7 }, out[21..29]);
+
+    // col 1: i32 length=2, "ab"
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 2, 'a', 'b' }, out[29..35]);
+
+    buf.deinit();
 }
