@@ -7,3 +7,7 @@ tests/pgdata/
 tests/pg.log
 tests/server.crt
 tests/server.key
+
+# Cross-client benchmark build artifacts
+benchmarks/pgx_bench/pgx_bench
+benchmarks/rust_bench/target/
