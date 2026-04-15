@@ -158,6 +158,14 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
 
         pub fn finish(self: *Self) !i64 {
             if (self.finished) return 0;
+
+            // Ensure the reader flow opened by copyInOpts is always ended,
+            // whether we return normally or propagate an error from any of
+            // the writes below.
+            defer self.conn._reader.endFlow() catch {
+                self.conn._state = .fail;
+            };
+
             try writeFooter(&self.buf);
             try self.flush();
             self.finished = true;
@@ -166,12 +174,6 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
             const done = proto.CopyDone{};
             try done.write(&self.conn._buf);
             try self.conn.write(self.conn._buf.string());
-
-            // Ensure the reader flow opened by copyInOpts is always ended,
-            // whether we return normally or propagate an error.
-            defer self.conn._reader.endFlow() catch {
-                self.conn._state = .fail;
-            };
 
             var affected: ?i64 = null;
             while (true) {
@@ -194,18 +196,20 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
 
         pub fn cancel(self: *Self, reason: []const u8) !void {
             if (self.finished) return;
+
+            // Ensure the reader flow opened by copyInOpts is always ended,
+            // whether we drain to ReadyForQuery or propagate an error from
+            // any of the writes below.
+            defer self.conn._reader.endFlow() catch {
+                self.conn._state = .fail;
+            };
+
             self.finished = true;
 
             self.conn._buf.reset();
             const cf = proto.CopyFail{ .reason = reason };
             try cf.write(&self.conn._buf);
             try self.conn.write(self.conn._buf.string());
-
-            // Ensure the reader flow opened by copyInOpts is always ended,
-            // whether we drain to ReadyForQuery or propagate an error.
-            defer self.conn._reader.endFlow() catch {
-                self.conn._state = .fail;
-            };
 
             while (true) {
                 const msg = self.conn.read() catch |err| {
