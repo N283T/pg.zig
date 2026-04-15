@@ -467,3 +467,69 @@ test "CopyIn: 100k rows triggers multiple flushes" {
 
     _ = try conn.exec("drop table copy_test_big", .{});
 }
+
+test "CopyIn: all primitive types round-trip" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_types", .{});
+    _ = try conn.exec(
+        "create table copy_test_types (" ++
+            " a bool not null," ++
+            " b int2 not null," ++
+            " c int4 not null," ++
+            " d int8 not null," ++
+            " e float4 not null," ++
+            " f float8 not null," ++
+            " g text not null" ++
+            ")",
+        .{},
+    );
+
+    var copy = try conn.copyIn(
+        "copy copy_test_types (a, b, c, d, e, f, g) from stdin binary",
+        .{ bool, i16, i32, i64, f32, f64, []const u8 },
+    );
+    defer copy.deinit();
+    try copy.writeRow(.{ true, @as(i16, -7), @as(i32, 7), @as(i64, 7000000000), @as(f32, 1.5), @as(f64, 2.5), "ok" });
+    try t.expectEqual(@as(i64, 1), try copy.finish());
+
+    var result = try conn.queryOpts("select a, b, c, d, e, f, g from copy_test_types", .{}, .{});
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(true, try row.get(bool, 0));
+    try t.expectEqual(@as(i16, -7), try row.get(i16, 1));
+    try t.expectEqual(@as(i32, 7), try row.get(i32, 2));
+    try t.expectEqual(@as(i64, 7000000000), try row.get(i64, 3));
+    try t.expectEqual(@as(f32, 1.5), try row.get(f32, 4));
+    try t.expectEqual(@as(f64, 2.5), try row.get(f64, 5));
+    try t.expectString("ok", try row.get([]const u8, 6));
+    _ = try result.next(); // drain
+
+    _ = try conn.exec("drop table copy_test_types", .{});
+}
+
+test "CopyIn: zero rows returns 0 affected" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_empty", .{});
+    _ = try conn.exec("create table copy_test_empty (n int4 not null)", .{});
+
+    {
+        var copy = try conn.copyIn(
+            "copy copy_test_empty (n) from stdin binary",
+            .{i32},
+        );
+        defer copy.deinit();
+        try t.expectEqual(@as(i64, 0), try copy.finish());
+    }
+
+    var result = try conn.queryOpts("select count(*)::int4 from copy_test_empty", .{}, .{});
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(@as(i32, 0), try row.get(i32, 0));
+    _ = try result.next(); // drain
+
+    _ = try conn.exec("drop table copy_test_empty", .{});
+}
