@@ -122,7 +122,6 @@ pub fn copyIntoTableImpl(conn: *Conn, table: []const u8, rows: anytype, opts: Co
 pub fn CopyIn(comptime ColumnTypes: anytype) type {
     return struct {
         const Self = @This();
-        pub const num_columns: i16 = @intCast(ColumnTypes.len);
 
         conn: *Conn,
         buf: Buffer,
