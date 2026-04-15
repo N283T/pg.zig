@@ -4,6 +4,7 @@ const Buffer = @import("buffer").Buffer;
 
 const Allocator = std.mem.Allocator;
 const Conn = lib.Conn;
+const log = lib.log;
 const proto = lib.proto;
 const types = lib.types;
 
@@ -122,65 +123,80 @@ pub fn copyIntoTableImpl(conn: *Conn, table: []const u8, rows: anytype, opts: Co
 pub fn CopyIn(comptime ColumnTypes: anytype) type {
     return struct {
         const Self = @This();
+        // State machine for a single COPY FROM STDIN flow.
+        //   active     - accepting writeRow / flush
+        //   done       - finish() completed successfully
+        //   cancelled  - cancel() completed successfully
+        //   failed     - a writeRow/flush/finish/cancel errored mid-flight;
+        //                the underlying wire is potentially desynced and no
+        //                further operations on this handle are useful
+        const State = enum { active, done, cancelled, failed };
 
-        conn: *Conn,
-        buf: Buffer,
-        opts: CopyOpts,
-        finished: bool,
+        _conn: *Conn,
+        _buf: Buffer,
+        _opts: CopyOpts,
+        _state: State,
 
         pub fn init(conn: *Conn, opts: CopyOpts) !Self {
             var buf = try Buffer.init(conn._allocator, @max(opts.flush_threshold, HEADER_LEN + 64));
             errdefer buf.deinit();
             try writeHeader(&buf);
             return .{
-                .conn = conn,
-                .buf = buf,
-                .opts = opts,
-                .finished = false,
+                ._conn = conn,
+                ._buf = buf,
+                ._opts = opts,
+                ._state = .active,
             };
         }
 
         pub fn writeRow(self: *Self, values: anytype) !void {
-            if (self.finished) return error.CopyInFinished;
-            try writeRowInto(ColumnTypes, &self.buf, values);
-            if (self.buf.len() >= self.opts.flush_threshold) {
+            if (self._state != .active) return error.CopyInClosed;
+            // Any failure between here and a successful return leaves the
+            // wire in an indeterminate state, so mark the handle closed.
+            errdefer self._state = .failed;
+            try writeRowInto(ColumnTypes, &self._buf, values);
+            if (self._buf.len() >= self._opts.flush_threshold) {
                 try self.flush();
             }
         }
 
         pub fn flush(self: *Self) !void {
-            if (self.buf.len() == 0) return;
-            const cd = proto.CopyData{ .payload = self.buf.string() };
-            self.conn._buf.reset();
-            try cd.write(&self.conn._buf);
-            try self.conn.write(self.conn._buf.string());
-            self.buf.reset();
+            if (self._buf.len() == 0) return;
+            const cd = proto.CopyData{ .payload = self._buf.string() };
+            self._conn._buf.reset();
+            try cd.write(&self._conn._buf);
+            try self._conn.write(self._conn._buf.string());
+            self._buf.reset();
         }
 
         pub fn finish(self: *Self) !i64 {
-            if (self.finished) return 0;
+            if (self._state != .active) return error.CopyInClosed;
+            // Transition eagerly so that any failure below still prevents
+            // re-entry (and stops deinit from running cancel on a half-closed
+            // flow whose endFlow defer has already fired). errdefer then
+            // downgrades to .failed if we exit via an error path, so the
+            // caller can tell successful completion from wire desync.
+            self._state = .done;
+            errdefer self._state = .failed;
 
-            // Ensure the reader flow opened by copyInOpts is always ended,
-            // whether we return normally or propagate an error from any of
-            // the writes below.
-            defer self.conn._reader.endFlow() catch {
-                self.conn._state = .fail;
+            defer self._conn._reader.endFlow() catch |flow_err| {
+                log.err("CopyIn.finish: endFlow failed: {}", .{flow_err});
+                self._conn._state = .fail;
             };
 
-            try writeFooter(&self.buf);
+            try writeFooter(&self._buf);
             try self.flush();
-            self.finished = true;
 
-            self.conn._buf.reset();
+            self._conn._buf.reset();
             const done = proto.CopyDone{};
-            try done.write(&self.conn._buf);
-            try self.conn.write(self.conn._buf.string());
+            try done.write(&self._conn._buf);
+            try self._conn.write(self._conn._buf.string());
 
             var affected: ?i64 = null;
             while (true) {
-                const msg = self.conn.read() catch |err| {
+                const msg = self._conn.read() catch |err| {
                     if (err == error.PG) {
-                        self.conn.readyForQuery() catch {};
+                        self._conn.readyForQuery() catch {};
                     }
                     return err;
                 };
@@ -190,27 +206,28 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
                         affected = cc.rowsAffected();
                     },
                     'Z' => return affected orelse 0,
-                    else => return self.conn.unexpectedDBMessage(),
+                    else => return self._conn.unexpectedDBMessage(),
                 }
             }
         }
 
         pub fn cancel(self: *Self, reason: []const u8) !void {
-            if (self.finished) return;
+            if (self._state != .active) return error.CopyInClosed;
+            // Eager transition — same reasoning as finish. errdefer
+            // downgrades to .failed on error so deinit can skip the
+            // doomed second round-trip.
+            self._state = .cancelled;
+            errdefer self._state = .failed;
 
-            // Ensure the reader flow opened by copyInOpts is always ended,
-            // whether we drain to ReadyForQuery or propagate an error from
-            // any of the writes below.
-            defer self.conn._reader.endFlow() catch {
-                self.conn._state = .fail;
+            defer self._conn._reader.endFlow() catch |flow_err| {
+                log.err("CopyIn.cancel: endFlow failed: {}", .{flow_err});
+                self._conn._state = .fail;
             };
 
-            self.finished = true;
-
-            self.conn._buf.reset();
+            self._conn._buf.reset();
             const cf = proto.CopyFail{ .reason = reason };
-            try cf.write(&self.conn._buf);
-            try self.conn.write(self.conn._buf.string());
+            try cf.write(&self._conn._buf);
+            try self._conn.write(self._conn._buf.string());
 
             // The server is expected to emit exactly one ErrorResponse in reply to
             // CopyFail, followed by ReadyForQuery. Swallow that first error so
@@ -218,10 +235,20 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
             // caller can observe unexpected server behaviour.
             var swallowed_expected_error = false;
             while (true) {
-                const msg = self.conn.read() catch |err| {
+                const msg = self._conn.read() catch |err| {
                     if (err == error.PG and !swallowed_expected_error) {
                         // Expected: this is the server's response to our CopyFail.
-                        self.conn.err = null;
+                        // Log the SQLSTATE/message at debug level so that if the
+                        // server actually sent something unexpected (permission
+                        // revoked mid-COPY, FATAL shutdown, etc.) the evidence
+                        // isn't silently discarded.
+                        if (self._conn.err) |pg_err| {
+                            log.debug(
+                                "CopyIn.cancel: swallowed expected ErrorResponse {s}: {s}",
+                                .{ pg_err.code, pg_err.message },
+                            );
+                        }
+                        self._conn.err = null;
                         swallowed_expected_error = true;
                         continue;
                     }
@@ -232,12 +259,17 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
         }
 
         pub fn deinit(self: *Self) void {
-            if (!self.finished) {
-                self.cancel("aborted by deinit") catch {
-                    self.conn._state = .fail;
+            if (self._state == .active) {
+                self.cancel("aborted by deinit") catch |err| {
+                    log.err("CopyIn.deinit: auto-cancel failed: {}", .{err});
+                    self._conn._state = .fail;
                 };
             }
-            self.buf.deinit();
+            // For .done/.cancelled the flow is already clean; for .failed the
+            // wire is desynced and the conn has already been marked .fail, so
+            // another cancel() round-trip just adds noise. Either way, only
+            // the local buffer needs freeing here.
+            self._buf.deinit();
         }
     };
 }
@@ -689,8 +721,8 @@ test "CopyIn: writeRow after finish returns error" {
     try copy.writeRow(.{@as(i32, 1)});
     _ = try copy.finish();
 
-    // writeRow after finish should return error.CopyInFinished, not succeed silently.
-    try t.expectError(error.CopyInFinished, copy.writeRow(.{@as(i32, 2)}));
+    // writeRow after finish should return error.CopyInClosed, not succeed silently.
+    try t.expectError(error.CopyInClosed, copy.writeRow(.{@as(i32, 2)}));
 
     // Connection should still be usable (no protocol desync).
     _ = try conn.exec("select 1", .{});
@@ -726,7 +758,7 @@ test "CopyIn: Conn.exec returns ConnectionBusy while CopyIn is active" {
     _ = try conn.exec("drop table copy_test_busy", .{});
 }
 
-test "CopyIn: finish called twice returns 0 on the second call" {
+test "CopyIn: finish after finish returns error.CopyInClosed" {
     var conn = t.connect(.{});
     defer conn.deinit();
 
@@ -742,13 +774,186 @@ test "CopyIn: finish called twice returns 0 on the second call" {
     const first = try copy.finish();
     try t.expectEqual(@as(i64, 1), first);
 
-    // Second finish should short-circuit to 0, no wire traffic.
-    const second = try copy.finish();
-    try t.expectEqual(@as(i64, 0), second);
+    // Second finish must fail loudly rather than silently returning 0.
+    try t.expectError(error.CopyInClosed, copy.finish());
 
     // Conn must still be usable.
     _ = try conn.exec("select 1", .{});
     _ = try conn.exec("drop table copy_test_finish_twice", .{});
+}
+
+test "CopyIn: cancel after finish returns error.CopyInClosed" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_cancel_after_finish", .{});
+    _ = try conn.exec("create table copy_test_cancel_after_finish (n int4 not null)", .{});
+
+    var copy = try conn.copyIn(
+        "copy copy_test_cancel_after_finish (n) from stdin binary",
+        .{i32},
+    );
+    defer copy.deinit();
+    try copy.writeRow(.{@as(i32, 1)});
+    _ = try copy.finish();
+
+    // cancel after a successful finish should error, not silently no-op.
+    try t.expectError(error.CopyInClosed, copy.cancel("too late"));
+
+    _ = try conn.exec("select 1", .{});
+    _ = try conn.exec("drop table copy_test_cancel_after_finish", .{});
+}
+
+test "CopyIn: finish after cancel returns error.CopyInClosed" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_finish_after_cancel", .{});
+    _ = try conn.exec("create table copy_test_finish_after_cancel (n int4 not null)", .{});
+
+    var copy = try conn.copyIn(
+        "copy copy_test_finish_after_cancel (n) from stdin binary",
+        .{i32},
+    );
+    defer copy.deinit();
+    try copy.writeRow(.{@as(i32, 1)});
+    try copy.cancel("user cancel");
+
+    // finish after a successful cancel should error, not silently return 0.
+    try t.expectError(error.CopyInClosed, copy.finish());
+
+    _ = try conn.exec("select 1", .{});
+    _ = try conn.exec("drop table copy_test_finish_after_cancel", .{});
+}
+
+test "CopyIn: cancel after cancel returns error.CopyInClosed" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_cancel_twice", .{});
+    _ = try conn.exec("create table copy_test_cancel_twice (n int4 not null)", .{});
+
+    var copy = try conn.copyIn(
+        "copy copy_test_cancel_twice (n) from stdin binary",
+        .{i32},
+    );
+    defer copy.deinit();
+    try copy.writeRow(.{@as(i32, 1)});
+    try copy.cancel("first");
+
+    // Second cancel must not send another CopyFail; it should surface the
+    // misuse to the caller instead of silently no-op'ing.
+    try t.expectError(error.CopyInClosed, copy.cancel("second"));
+
+    // Conn must still be usable (no protocol desync from a bogus second send).
+    _ = try conn.exec("select 1", .{});
+    _ = try conn.exec("drop table copy_test_cancel_twice", .{});
+}
+
+test "CopyIn: deinit after successful finish does not corrupt the connection" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_deinit_after_finish", .{});
+    _ = try conn.exec("create table copy_test_deinit_after_finish (n int4 not null)", .{});
+
+    {
+        var copy = try conn.copyIn(
+            "copy copy_test_deinit_after_finish (n) from stdin binary",
+            .{i32},
+        );
+        defer copy.deinit();
+        try copy.writeRow(.{@as(i32, 7)});
+        _ = try copy.finish();
+        // Explicit cancel attempt after finish: the guard must reject it.
+        // This pins down "deinit won't re-enter cancel on a finished handle"
+        // against future refactors that might flip the state check.
+        try t.expectError(error.CopyInClosed, copy.cancel("should not send"));
+    }
+
+    // After deinit, the conn must be clean: the previously inserted row is
+    // visible and further queries succeed.
+    var result = try conn.queryOpts(
+        "select count(*)::int4 from copy_test_deinit_after_finish",
+        .{},
+        .{},
+    );
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(@as(i32, 1), try row.get(i32, 0));
+    _ = try result.next();
+
+    _ = try conn.exec("drop table copy_test_deinit_after_finish", .{});
+}
+
+test "CopyIn: deinit after successful cancel does not send a second CopyFail" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_deinit_after_cancel", .{});
+    _ = try conn.exec("create table copy_test_deinit_after_cancel (n int4 not null)", .{});
+
+    {
+        var copy = try conn.copyIn(
+            "copy copy_test_deinit_after_cancel (n) from stdin binary",
+            .{i32},
+        );
+        defer copy.deinit();
+        try copy.writeRow(.{@as(i32, 3)});
+        try copy.cancel("user cancel");
+        // Re-cancel guard: also exercised by cancel-after-cancel above, but
+        // repeating it here documents the deinit contract directly.
+        try t.expectError(error.CopyInClosed, copy.cancel("ignored"));
+    }
+
+    var result = try conn.queryOpts(
+        "select count(*)::int4 from copy_test_deinit_after_cancel",
+        .{},
+        .{},
+    );
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(@as(i32, 0), try row.get(i32, 0));
+    _ = try result.next();
+
+    _ = try conn.exec("drop table copy_test_deinit_after_cancel", .{});
+}
+
+test "CopyIn: finish failure transitions handle to closed state" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_fail_closed", .{});
+    _ = try conn.exec(
+        "create table copy_test_fail_closed (id int4 not null, name text not null)",
+        .{},
+    );
+
+    {
+        var copy = try conn.copyIn(
+            "copy copy_test_fail_closed (id, name) from stdin binary",
+            .{ i32, ?[]const u8 },
+        );
+        defer copy.deinit();
+        try copy.writeRow(.{ @as(i32, 1), null });
+
+        // Server rejects the row (NOT NULL violation), so finish returns
+        // error.PG. The eager .done transition + errdefer downgrades the
+        // handle to .failed so that any follow-up op is rejected cleanly
+        // rather than retrying against a desynced wire.
+        try t.expectError(error.PG, copy.finish());
+
+        try t.expectError(
+            error.CopyInClosed,
+            copy.writeRow(.{ @as(i32, 2), @as(?[]const u8, "ok") }),
+        );
+        try t.expectError(error.CopyInClosed, copy.finish());
+        try t.expectError(error.CopyInClosed, copy.cancel("retry"));
+    }
+
+    // Conn is reusable because finish's error path drained to ReadyForQuery.
+    _ = try conn.exec("select 1", .{});
+    _ = try conn.exec("drop table copy_test_fail_closed", .{});
 }
 
 test "CopyIn: text-mode COPY rejected with UnexpectedDBMessage" {
