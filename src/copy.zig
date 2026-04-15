@@ -38,6 +38,48 @@ fn writeFooter(buf: *Buffer) !void {
     try buf.writeIntBig(i16, -1);
 }
 
+fn fieldTypesValue(comptime Row: type) [std.meta.fields(Row).len]type {
+    const fields = std.meta.fields(Row);
+    var arr: [fields.len]type = undefined;
+    inline for (fields, 0..) |f, i| arr[i] = f.type;
+    return arr;
+}
+
+pub fn copyIntoImpl(conn: *Conn, sql: []const u8, rows: anytype, opts: CopyOpts) !i64 {
+    const Slice = @TypeOf(rows);
+    const Row = comptime blk: {
+        const ti = @typeInfo(Slice);
+        switch (ti) {
+            .pointer => |p| {
+                if (p.size == .slice or p.size == .many) break :blk p.child;
+                if (p.size == .one) {
+                    const inner = @typeInfo(p.child);
+                    if (inner == .array) break :blk inner.array.child;
+                }
+            },
+            .array => |a| break :blk a.child,
+            else => {},
+        }
+        @compileError("copyInto expects a slice or array of structs, got " ++ @typeName(Slice));
+    };
+    const ColumnTypes = comptime fieldTypesValue(Row);
+    const TupleT = comptime std.meta.Tuple(&ColumnTypes);
+
+    var copy = try conn.copyInOpts(sql, ColumnTypes, opts);
+    defer copy.deinit();
+
+    const fields = comptime std.meta.fields(Row);
+    for (rows) |row| {
+        var tuple: TupleT = undefined;
+        inline for (fields, 0..) |f, i| {
+            tuple[i] = @field(row, f.name);
+        }
+        try copy.writeRow(tuple);
+    }
+
+    return copy.finish();
+}
+
 pub fn CopyIn(comptime ColumnTypes: anytype) type {
     return struct {
         const Self = @This();
@@ -233,4 +275,35 @@ test "CopyIn: happy path inserts rows" {
     try t.expectEqual(@as(usize, 3), i);
 
     _ = try conn.exec("drop table copy_test_basic", .{});
+}
+
+test "copyInto: struct slice helper" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_into", .{});
+    _ = try conn.exec(
+        "create table copy_test_into (id int4 not null, name text not null)",
+        .{},
+    );
+
+    const Row = struct { id: i32, name: []const u8 };
+    const rows = [_]Row{
+        .{ .id = 10, .name = "x" },
+        .{ .id = 20, .name = "y" },
+    };
+
+    const n = try conn.copyInto(
+        "copy copy_test_into (id, name) from stdin binary",
+        &rows,
+    );
+    try t.expectEqual(@as(i64, 2), n);
+
+    var result = try conn.queryOpts("select count(*)::int4 from copy_test_into", .{}, .{});
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(@as(i32, 2), try row.get(i32, 0));
+    try t.expectEqual(null, try result.next());
+
+    _ = try conn.exec("drop table copy_test_into", .{});
 }

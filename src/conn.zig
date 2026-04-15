@@ -466,6 +466,14 @@ pub const Conn = struct {
         }
     }
 
+    pub fn copyInto(self: *Conn, sql: []const u8, rows: anytype) !i64 {
+        return lib.copy.copyIntoImpl(self, sql, rows, .{});
+    }
+
+    pub fn copyIntoOpts(self: *Conn, sql: []const u8, rows: anytype, opts: lib.copy.CopyOpts) !i64 {
+        return lib.copy.copyIntoImpl(self, sql, rows, opts);
+    }
+
     pub fn begin(self: *Conn) !void {
         self._state = .transaction;
         _ = try self.execOpts("begin", .{}, .{});
