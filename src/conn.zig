@@ -453,7 +453,13 @@ pub const Conn = struct {
                         self._state = .fail;
                         return error.UnexpectedDBMessage;
                     }
-                    return lib.copy.CopyIn(ColumnTypes).init(self, opts);
+                    return lib.copy.CopyIn(ColumnTypes).init(self, opts) catch |err| {
+                        // init allocates a Buffer + writes the header; on failure the
+                        // server is still in COPY mode and we've transitioned to
+                        // .copy_in. Drop to .fail so the pool disposes the conn.
+                        self._state = .fail;
+                        return err;
+                    };
                 },
                 else => return self.unexpectedDBMessage(),
             }
