@@ -389,6 +389,49 @@ And it **will** work. But you're playing with fire, and you should just include 
 
 You can call `try conn.deallocate("super")` to remove a cache entry. But this is only done for the connection on which it is called. This would make sense, for example, if you get a connection from the pool, execute the same query multiple times, deallocate the cached entry, and return the connection back to the pool. Note that the name to deallocate, `super`, is not sanitized and is open to SQL injection - don't pass a user-supplied value to `deallocte`.
 
+## Bulk insert (COPY)
+
+For high-throughput inserts, pg.zig supports the PostgreSQL **COPY FROM
+STDIN BINARY** sub-protocol. There are three layered entry points:
+
+```zig
+const Row = struct { id: i32, name: []const u8, created_at: i64 };
+const rows: []const Row = &.{
+    .{ .id = 1, .name = "Alice", .created_at = 1_700_000_000 },
+    .{ .id = 2, .name = "Bob",   .created_at = 1_700_000_001 },
+};
+
+// Most ergonomic: field names are used as column names.
+_ = try conn.copyIntoTable("users", rows);
+
+// Same data with caller-supplied SQL (e.g. for schema-qualified names).
+_ = try conn.copyInto(
+    "copy users (id, name, created_at) from stdin binary",
+    rows,
+);
+
+// Streaming primitive (no need to materialise all rows in memory).
+var copy = try conn.copyIn(
+    "copy users (id, name, created_at) from stdin binary",
+    .{ i32, []const u8, i64 },
+);
+defer copy.deinit();
+while (try iter.next()) |item| {
+    try copy.writeRow(.{ item.id, item.name, item.ts });
+}
+const affected = try copy.finish();
+```
+
+The streaming primitive automatically flushes its internal buffer when it
+exceeds 64 KiB (configurable via `copyInOpts(..., .{ .flush_threshold = N })`).
+Forgetting to call `finish` causes `deinit` to send `CopyFail`, which
+PostgreSQL treats as an abort — no rows are committed.
+
+Supported column types are the same primitive set the parameter-bind path
+supports (`bool`, `i16`/`u16`, `i32`/`u32`, `i64`/`u64`, `f32`, `f64`,
+`[]const u8`, fixed-size byte arrays, and the `?T` form for nullable
+columns). Only the **binary** wire format is supported in this version.
+
 ## Important Notice 1 - Bind vs Read
 When you read a value, e.g. using `row.get`, the library is strict and won't help you with type conversion. If you're column is a smallint, you have to `get`
 an `i16.
