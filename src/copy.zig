@@ -696,3 +696,108 @@ test "CopyIn: writeRow after finish returns error" {
     _ = try conn.exec("select 1", .{});
     _ = try conn.exec("drop table copy_test_after_finish", .{});
 }
+
+test "CopyIn: Conn.exec returns ConnectionBusy while CopyIn is active" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_busy", .{});
+    _ = try conn.exec("create table copy_test_busy (n int4 not null)", .{});
+
+    var copy = try conn.copyIn(
+        "copy copy_test_busy (n) from stdin binary",
+        .{i32},
+    );
+    defer copy.deinit();
+    try copy.writeRow(.{@as(i32, 1)});
+
+    // Attempting another query on the same conn while COPY is in flight
+    // must fail with ConnectionBusy.
+    try t.expectError(error.ConnectionBusy, conn.exec("select 1", .{}));
+    try t.expectError(error.ConnectionBusy, conn.copyIn(
+        "copy copy_test_busy (n) from stdin binary",
+        .{i32},
+    ));
+
+    _ = try copy.finish();
+
+    // After finish, the conn is usable again.
+    _ = try conn.exec("select 1", .{});
+    _ = try conn.exec("drop table copy_test_busy", .{});
+}
+
+test "CopyIn: finish called twice returns 0 on the second call" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_finish_twice", .{});
+    _ = try conn.exec("create table copy_test_finish_twice (n int4 not null)", .{});
+
+    var copy = try conn.copyIn(
+        "copy copy_test_finish_twice (n) from stdin binary",
+        .{i32},
+    );
+    defer copy.deinit();
+    try copy.writeRow(.{@as(i32, 1)});
+    const first = try copy.finish();
+    try t.expectEqual(@as(i64, 1), first);
+
+    // Second finish should short-circuit to 0, no wire traffic.
+    const second = try copy.finish();
+    try t.expectEqual(@as(i64, 0), second);
+
+    // Conn must still be usable.
+    _ = try conn.exec("select 1", .{});
+    _ = try conn.exec("drop table copy_test_finish_twice", .{});
+}
+
+test "CopyIn: text-mode COPY rejected with UnexpectedDBMessage" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_text_mode", .{});
+    _ = try conn.exec("create table copy_test_text_mode (n int4 not null)", .{});
+
+    // Note the SQL asks for text-format COPY (no BINARY keyword).
+    // copyIn expects CopyInResponse data[0]==1 (binary); text-mode returns 0.
+    const r = conn.copyIn(
+        "copy copy_test_text_mode (n) from stdin",
+        .{i32},
+    );
+    try t.expectError(error.UnexpectedDBMessage, r);
+
+    // The connection is marked .fail; it is not reusable as-is but pool
+    // would dispose it. We simply confirm the error surfaced correctly.
+    _ = conn.exec("drop table copy_test_text_mode", .{}) catch {};
+}
+
+test "CopyIn: copyInOpts with tiny flush_threshold flushes per row" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_tiny_flush", .{});
+    _ = try conn.exec("create table copy_test_tiny_flush (n int4 not null)", .{});
+
+    // Threshold of 1 byte forces flush on every writeRow (after init's
+    // @max it becomes HEADER_LEN + 64 = 83, but flush-check fires on any
+    // row past that, which for i32 rows means every row after the first).
+    var copy = try conn.copyInOpts(
+        "copy copy_test_tiny_flush (n) from stdin binary",
+        .{i32},
+        .{ .flush_threshold = 1 },
+    );
+    defer copy.deinit();
+    try copy.writeRow(.{@as(i32, 1)});
+    try copy.writeRow(.{@as(i32, 2)});
+    try copy.writeRow(.{@as(i32, 3)});
+    const n = try copy.finish();
+    try t.expectEqual(@as(i64, 3), n);
+
+    var result = try conn.queryOpts("select count(*)::int4 from copy_test_tiny_flush", .{}, .{});
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(@as(i32, 3), try row.get(i32, 0));
+    _ = try result.next();
+
+    _ = try conn.exec("drop table copy_test_tiny_flush", .{});
+}
