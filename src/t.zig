@@ -203,6 +203,7 @@ pub fn connect(opts: anytype) Conn {
         .tls = if (@hasField(T, "tls")) opts.tls else .off,
         .host = if (@hasField(T, "host")) opts.host else "localhost",
         .read_buffer = if (@hasField(T, "read_buffer")) opts.read_buffer else 2000,
+        .stmt_cache_max = if (@hasField(T, "stmt_cache_max")) opts.stmt_cache_max else Conn.default_stmt_cache_max,
     }) catch unreachable;
 
     c.auth(authOpts(opts)) catch |err| {
