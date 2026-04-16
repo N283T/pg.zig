@@ -60,7 +60,21 @@ pub const Conn = struct {
     _param_oids: []i32,
 
     // cache_name => data necessary to re-execute previously prepared statement.
+    // Bounded: when cache exceeds _stmt_cache_max, the least-recently-used
+    // entry is evicted (its arena is freed).
     _prepared_statements: std.StringHashMapUnmanaged(Stmt.Describe),
+
+    // LRU access order for _prepared_statements. Oldest entry at index 0,
+    // most-recently-used at the end.
+    _stmt_cache_order: std.ArrayListUnmanaged([]const u8),
+    _stmt_cache_max: usize,
+
+    // Track total queries executed and connection creation time. Exposed via
+    // queryCount() and age() for Pool connection rotation.
+    _query_count: u64 = 0,
+    _created_at: i64 = 0,
+
+    pub const default_stmt_cache_max: usize = 256;
 
     const State = enum {
         idle,
@@ -84,6 +98,10 @@ pub const Conn = struct {
         write_buffer: ?u16 = null,
         read_buffer: ?u16 = null,
         result_state_size: u16 = 32,
+        // Maximum number of prepared statements retained on this connection.
+        // Oldest entries are evicted (by least-recent use) once the limit is
+        // reached. 0 disables the cap (unbounded, matches legacy behavior).
+        stmt_cache_max: usize = default_stmt_cache_max,
         tls: TLS = .off,
         _hostz: ?[:0]const u8 = null,
 
@@ -178,6 +196,9 @@ pub const Conn = struct {
             ._param_oids = param_oids,
             ._result_state = result_state,
             ._prepared_statements = .{},
+            ._stmt_cache_order = .{},
+            ._stmt_cache_max = opts.stmt_cache_max,
+            ._created_at = std.time.timestamp(),
         };
     }
 
@@ -201,6 +222,60 @@ pub const Conn = struct {
             value_ptr.arena.deinit();
         }
         self._prepared_statements.deinit(self._allocator);
+        self._stmt_cache_order.deinit(self._allocator);
+    }
+
+    pub fn queryCount(self: *const Conn) u64 {
+        return self._query_count;
+    }
+
+    pub fn age(self: *const Conn) i64 {
+        return std.time.timestamp() - self._created_at;
+    }
+
+    // Move `name` to the tail of the LRU order. Caller guarantees `name` is
+    // already tracked. If somehow missing, this silently no-ops.
+    //
+    // We re-append the slice returned by `orderedRemove`, not the caller's
+    // `name`. The list and hash-map keys share backing memory (owned by each
+    // entry's describe arena); preserving that invariant lets callers pass
+    // short-lived `cache_name` slices safely.
+    fn stmtCacheTouch(self: *Conn, name: []const u8) void {
+        const items = self._stmt_cache_order.items;
+        for (items, 0..) |item, i| {
+            if (std.mem.eql(u8, item, name)) {
+                const owned = self._stmt_cache_order.orderedRemove(i);
+                // Re-append cannot fail: capacity is unchanged by orderedRemove.
+                self._stmt_cache_order.appendAssumeCapacity(owned);
+                return;
+            }
+        }
+    }
+
+    // Drop the oldest entry (head of LRU order). Sends DEALLOCATE so the
+    // name is freed server-side too, otherwise the next cache miss that
+    // happens to reuse this name would fail with PG 42P05 ("prepared
+    // statement already exists"). Fallible because the DEALLOCATE uses
+    // execOpts (network + allocator).
+    fn stmtCacheEvictOldest(self: *Conn) !void {
+        if (self._stmt_cache_order.items.len == 0) return;
+        // Peek the oldest name but keep the entry in both structures until
+        // after DEALLOCATE succeeds, so a failure here leaves the cache in
+        // a consistent state.
+        const oldest_name = self._stmt_cache_order.items[0];
+        const allocator = self._allocator;
+        const sql = try std.fmt.allocPrint(allocator, "deallocate {s}", .{oldest_name});
+        defer allocator.free(sql);
+        // execOpts increments _query_count; the DEALLOCATE is internal
+        // bookkeeping, not a user query, so restore the counter after.
+        const saved_count = self._query_count;
+        _ = try self.execOpts(sql, .{}, .{});
+        self._query_count = saved_count;
+        _ = self._stmt_cache_order.orderedRemove(0);
+        if (self._prepared_statements.fetchRemove(oldest_name)) |kv| {
+            var describe = kv.value;
+            describe.arena.deinit();
+        }
     }
 
     pub fn release(self: *Conn) void {
@@ -247,6 +322,7 @@ pub const Conn = struct {
             self.maybeRelease(opts.release_conn);
             return error.ConnectionBusy;
         }
+        self._query_count +%= 1;
 
         var cached = false;
         var stmt: Stmt = undefined;
@@ -257,6 +333,9 @@ pub const Conn = struct {
                 cached = true;
                 stmt = try Stmt.fromDescribe(self, describe, opts);
                 errdefer stmt.deinit();
+
+                // Promote this entry to most-recently-used.
+                self.stmtCacheTouch(n);
 
                 try self._reader.startFlow(stmt.arena.allocator(), opts.timeout);
                 // Send a "SYNC" command
@@ -276,6 +355,17 @@ pub const Conn = struct {
 
             errdefer stmt.deinit();
             if (name) |n| {
+                // Reserve capacity and (if necessary) evict BEFORE issuing
+                // Parse for the new statement: eviction sends DEALLOCATE via
+                // execOpts which resets the shared conn buffer, and
+                // stmt.prepare leaves partially-written Bind bytes in that
+                // buffer that stmt.execute later consumes.
+                try self._stmt_cache_order.ensureUnusedCapacity(self._allocator, 1);
+                try self._prepared_statements.ensureUnusedCapacity(self._allocator, 1);
+                if (self._stmt_cache_max != 0 and self._stmt_cache_order.items.len >= self._stmt_cache_max) {
+                    try self.stmtCacheEvictOldest();
+                }
+
                 var describe_arena = ArenaAllocator.init(self._allocator);
                 errdefer describe_arena.deinit();
                 try stmt.prepare(sql, describe_arena.allocator());
@@ -284,7 +374,9 @@ pub const Conn = struct {
                 // param_oids and result_state will be create with it specifically
                 // so that we can copy them here.
                 const owned_name = try describe_arena.allocator().dupe(u8, n);
-                try self._prepared_statements.put(self._allocator, owned_name, .{
+                self._stmt_cache_order.appendAssumeCapacity(owned_name);
+                errdefer _ = self._stmt_cache_order.pop();
+                self._prepared_statements.putAssumeCapacity(owned_name, .{
                     .arena = describe_arena,
                     .param_oids = stmt.param_oids,
                     .result_state = stmt.result_state,
@@ -364,6 +456,9 @@ pub const Conn = struct {
         buf.reset();
 
         if (values.len == 0) {
+            // Parameterless path does not funnel through queryOpts, so we
+            // must count the query here to keep queryCount() accurate.
+            self._query_count +%= 1;
             try self._reader.startFlow(opts.allocator, opts.timeout);
             defer self._reader.endFlow() catch {
                 // this can only fail in extreme conditions (OOM) and it will only impact
@@ -524,6 +619,13 @@ pub const Conn = struct {
 
     pub fn deallocate(self: *Conn, cache_name: []const u8) !void {
         if (self._prepared_statements.fetchRemove(cache_name)) |kv| {
+            // Also drop the LRU-order entry for this cache_name.
+            for (self._stmt_cache_order.items, 0..) |item, i| {
+                if (std.mem.eql(u8, item, cache_name)) {
+                    _ = self._stmt_cache_order.orderedRemove(i);
+                    break;
+                }
+            }
             kv.value.arena.deinit();
         }
         const allocator = self._allocator;
@@ -2103,3 +2205,111 @@ const DummyEnum = enum {
     val1,
     val2,
 };
+
+test "Conn: stmt cache LRU eviction" {
+    var c = t.connect(.{ .stmt_cache_max = 3 });
+    defer c.deinit();
+
+    // Warm the cache with 3 distinct prepared statements.
+    const names = [_][]const u8{ "s1", "s2", "s3" };
+    for (names) |n| {
+        var r = try c.queryOpts("select 1", .{}, .{ .cache_name = n });
+        try r.drain();
+        r.deinit();
+    }
+    try t.expectEqual(3, c._prepared_statements.count());
+    try t.expectEqual(3, c._stmt_cache_order.items.len);
+
+    // Touch s1 so the LRU order becomes: s2, s3, s1.
+    {
+        var r = try c.queryOpts("select 1", .{}, .{ .cache_name = "s1" });
+        try r.drain();
+        r.deinit();
+    }
+
+    // Insert s4. s2 should be evicted (oldest); cache still bounded to 3.
+    {
+        var r = try c.queryOpts("select 1", .{}, .{ .cache_name = "s4" });
+        try r.drain();
+        r.deinit();
+    }
+    try t.expectEqual(3, c._prepared_statements.count());
+    try t.expectEqual(3, c._stmt_cache_order.items.len);
+    try t.expectEqual(false, c._prepared_statements.contains("s2"));
+    try t.expectEqual(true, c._prepared_statements.contains("s1"));
+    try t.expectEqual(true, c._prepared_statements.contains("s3"));
+    try t.expectEqual(true, c._prepared_statements.contains("s4"));
+}
+
+test "Conn: stmt cache unbounded when max is 0" {
+    var c = t.connect(.{ .stmt_cache_max = 0 });
+    defer c.deinit();
+
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        var buf: [8]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "u{d}", .{i});
+        var r = try c.queryOpts("select 1", .{}, .{ .cache_name = name });
+        try r.drain();
+        r.deinit();
+    }
+    try t.expectEqual(5, c._prepared_statements.count());
+}
+
+test "Conn: queryCount increments and age is non-negative" {
+    var c = t.connect(.{});
+    defer c.deinit();
+
+    const before = c.queryCount();
+    var r = try c.query("select 1", .{});
+    try r.drain();
+    r.deinit();
+    try t.expectEqual(before + 1, c.queryCount());
+    // age() returns seconds since init; should be >= 0.
+    try t.expectEqual(true, c.age() >= 0);
+}
+
+test "Conn: stmt cache eviction frees server-side name" {
+    // Regression: before DEALLOCATE-on-eviction, evicting a cached name
+    // and then reusing that same cache_name would fail with PG 42P05
+    // ("prepared statement already exists") because the server kept the
+    // prepared statement even after we dropped the client entry.
+    var c = t.connect(.{ .stmt_cache_max = 1 });
+    defer c.deinit();
+
+    {
+        var r = try c.queryOpts("select 1", .{}, .{ .cache_name = "reuse_me" });
+        try r.drain();
+        r.deinit();
+    }
+    // Insert a second distinct name: this evicts "reuse_me" from client and
+    // should DEALLOCATE it from the server.
+    {
+        var r = try c.queryOpts("select 2", .{}, .{ .cache_name = "other" });
+        try r.drain();
+        r.deinit();
+    }
+    try t.expectEqual(false, c._prepared_statements.contains("reuse_me"));
+
+    // Reusing the evicted name must succeed (proves DEALLOCATE fired).
+    var r = try c.queryOpts("select 3", .{}, .{ .cache_name = "reuse_me" });
+    defer r.deinit();
+    const row = (try r.next()) orelse unreachable;
+    try t.expectEqual(3, row.get(i32, 0));
+}
+
+test "Conn: deallocate drops LRU order entry" {
+    var c = t.connect(.{ .stmt_cache_max = 4 });
+    defer c.deinit();
+
+    {
+        var r = try c.queryOpts("select 1", .{}, .{ .cache_name = "d1" });
+        try r.drain();
+        r.deinit();
+    }
+    try t.expectEqual(1, c._stmt_cache_order.items.len);
+
+    try c.deallocate("d1");
+    try t.expectEqual(0, c._prepared_statements.count());
+    try t.expectEqual(0, c._stmt_cache_order.items.len);
+}

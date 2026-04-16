@@ -31,6 +31,14 @@ pub const Pool = struct {
         connect: Conn.Opts = .{},
         timeout: u32 = 10 * std.time.ms_per_s,
         connect_on_init_count: ?u16 = null,
+        // When > 0, a connection is replaced on release() once it has served
+        // this many queries. Useful to cap prepared-statement cache growth and
+        // to recycle long-lived sockets.
+        max_queries_per_conn: u64 = 0,
+        // When > 0, a connection is replaced on release() once it has been
+        // alive for this many seconds. Useful to recover from PG restarts and
+        // to bound connection-scoped state.
+        max_conn_lifetime: i64 = 0,
     };
 
     pub const Stats = struct {
@@ -45,6 +53,8 @@ pub const Pool = struct {
         defer po.deinit();
         po.opts.size = opts.size;
         po.opts.timeout = opts.timeout;
+        po.opts.max_queries_per_conn = opts.max_queries_per_conn;
+        po.opts.max_conn_lifetime = opts.max_conn_lifetime;
         return Pool.init(allocator, po.opts);
     }
 
@@ -161,12 +171,23 @@ pub const Pool = struct {
     pub fn release(self: *Pool, conn: *Conn) void {
         var conn_to_add = conn;
 
-        if (conn._state != .idle) {
-            lib.metrics.poolDirty();
-            // conn should always be idle when being released. It's possible we can
-            // recover from this (e.g. maybe we just need to read until we get a
-            // ReadyForQuery), but we wouldn't want to block for too long. For now,
-            // we'll just replace the connection.
+        const dirty = conn._state != .idle;
+        const rotate = blk: {
+            if (dirty) break :blk false;
+            const rot = self._opts;
+            if (rot.max_queries_per_conn > 0 and conn.queryCount() >= rot.max_queries_per_conn) break :blk true;
+            if (rot.max_conn_lifetime > 0 and conn.age() >= rot.max_conn_lifetime) break :blk true;
+            break :blk false;
+        };
+
+        if (dirty or rotate) {
+            if (dirty) {
+                lib.metrics.poolDirty();
+                // conn should always be idle when being released. It's possible we can
+                // recover from this (e.g. maybe we just need to read until we get a
+                // ReadyForQuery), but we wouldn't want to block for too long. For now,
+                // we'll just replace the connection.
+            }
             conn.deinit();
             self._allocator.destroy(conn);
 
@@ -535,6 +556,68 @@ test "Pool: Row error" {
     try t.expectError(error.PG, pool.rowUnsafe("insert into all_types (id) values ($1)", .{200}));
 
     try t.expectEqual(1, pool._available);
+}
+
+test "Pool: rotate by max_queries_per_conn" {
+    var pool = try Pool.init(t.allocator, .{
+        .size = 1,
+        .auth = t.authOpts(.{}),
+        .max_queries_per_conn = 2,
+    });
+    defer pool.deinit();
+
+    const c1 = try pool.acquire();
+    _ = try c1.exec("select 1", .{});
+    _ = try c1.exec("select 1", .{});
+    try t.expectEqual(2, c1.queryCount());
+    pool.release(c1);
+
+    // Rotation replaces the over-limit conn; the fresh one must be brand
+    // new. A zeroed queryCount is the authoritative signal (pointer
+    // comparisons are fragile — the allocator may hand back the same slot).
+    const c2 = try pool.acquire();
+    try t.expectEqual(0, c2.queryCount());
+    pool.release(c2);
+}
+
+test "Pool: no rotation when below thresholds" {
+    var pool = try Pool.init(t.allocator, .{
+        .size = 1,
+        .auth = t.authOpts(.{}),
+        .max_queries_per_conn = 10,
+    });
+    defer pool.deinit();
+
+    const c1 = try pool.acquire();
+    _ = try c1.exec("select 1", .{});
+    pool.release(c1);
+
+    // Without rotation the conn is reused: its queryCount persists.
+    const c2 = try pool.acquire();
+    try t.expectEqual(1, c2.queryCount());
+    pool.release(c2);
+}
+
+test "Pool: rotate by max_conn_lifetime" {
+    var pool = try Pool.init(t.allocator, .{
+        .size = 1,
+        .auth = t.authOpts(.{}),
+        .max_conn_lifetime = 1,
+    });
+    defer pool.deinit();
+
+    const c1 = try pool.acquire();
+    _ = try c1.exec("select 1", .{});
+    // Force conn to appear older than the lifetime cap without sleeping.
+    c1._created_at -= 5;
+    pool.release(c1);
+
+    // Rotation on age replaces the conn. Fresh conn has queryCount=0 and a
+    // small age.
+    const c2 = try pool.acquire();
+    try t.expectEqual(0, c2.queryCount());
+    try t.expectEqual(true, c2.age() < 5);
+    pool.release(c2);
 }
 
 fn testPool(p: *Pool) void {
