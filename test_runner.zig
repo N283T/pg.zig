@@ -252,6 +252,10 @@ const Env = struct {
     }
 
     fn readEnv(allocator: Allocator, key: []const u8) ?[]const u8 {
+        if (comptime builtin.os.tag == .windows or !builtin.link_libc) {
+            return null;
+        }
+
         var i: usize = 0;
         while (std.c.environ[i]) |entry_z| : (i += 1) {
             const entry = std.mem.span(entry_z);

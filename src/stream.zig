@@ -3,6 +3,7 @@ const lib = @import("lib.zig");
 
 const openssl = lib.openssl;
 
+const builtin = @import("builtin");
 const posix = std.posix;
 
 const Conn = lib.Conn;
@@ -148,7 +149,7 @@ const PlainStream = struct {
         const net_stream = blk: {
             const host = opts.host orelse DEFAULT_HOST;
             if (host.len > 0 and host[0] == '/') {
-                if (comptime Io.net.has_unix_sockets == false or std.posix.AF == void) {
+                if (comptime Io.net.has_unix_sockets == false) {
                     return error.UnixPathNotSupported;
                 }
                 const addr = try Io.net.UnixAddress.init(host);
@@ -189,34 +190,53 @@ const PlainStream = struct {
 };
 
 fn readStream(io: Io, stream: Io.net.Stream, buf: []u8) !usize {
-    _ = io;
-    if (buf.len == 0) return 0;
-    while (true) {
-        const rc = std.c.read(stream.socket.handle, buf.ptr, buf.len);
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
-            .INTR => continue,
-            .BADF => return 0,
-            .AGAIN => return error.WouldBlock,
-            .CONNRESET => return error.ConnectionResetByPeer,
-            else => return error.Unexpected,
+    if (comptime builtin.os.tag == .windows) {
+        var reader_buf: [1024]u8 = undefined;
+        var reader = stream.reader(io, &reader_buf);
+        return reader.interface.readSliceShort(buf) catch |err| switch (err) {
+            error.ReadFailed => reader.err orelse error.Unexpected,
+        };
+    } else {
+        if (buf.len == 0) return 0;
+        while (true) {
+            const rc = posix.system.read(stream.socket.handle, buf.ptr, buf.len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .BADF => return 0,
+                .AGAIN => return error.WouldBlock,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                .NOTCONN => return error.SocketUnconnected,
+                else => return error.Unexpected,
+            }
         }
     }
 }
 
 fn writeStream(io: Io, stream: Io.net.Stream, data: []const u8) !void {
-    _ = io;
-    var pos: usize = 0;
-    while (pos < data.len) {
-        const rc = std.c.write(stream.socket.handle, data[pos..].ptr, data.len - pos);
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => pos += @intCast(rc),
-            .INTR => continue,
-            .BADF => return error.SocketUnconnected,
-            .AGAIN => return error.WouldBlock,
-            .CONNRESET => return error.ConnectionResetByPeer,
-            .PIPE => return error.SocketUnconnected,
-            else => return error.WriteFailed,
+    if (comptime builtin.os.tag == .windows) {
+        var writer_buf: [1024]u8 = undefined;
+        var writer = stream.writer(io, &writer_buf);
+        writer.interface.writeAll(data) catch |err| switch (err) {
+            error.WriteFailed => return writer.err orelse error.WriteFailed,
+        };
+        return writer.interface.flush() catch |err| switch (err) {
+            error.WriteFailed => return writer.err orelse error.WriteFailed,
+        };
+    } else {
+        var pos: usize = 0;
+        while (pos < data.len) {
+            const rc = posix.system.write(stream.socket.handle, data[pos..].ptr, data.len - pos);
+            switch (posix.errno(rc)) {
+                .SUCCESS => pos += @intCast(rc),
+                .INTR => continue,
+                .BADF => return error.SocketUnconnected,
+                .AGAIN => return error.WouldBlock,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                .PIPE => return error.SocketUnconnected,
+                .NOTCONN => return error.SocketUnconnected,
+                else => return error.WriteFailed,
+            }
         }
     }
 }

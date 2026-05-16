@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Zig 0.16 tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Show Zig version
+        run: zig version
+
+      - name: Check formatting
+        run: zig fmt --check build.zig build.zig.zon example/build.zig example/main.zig benchmarks/copy_bench.zig test_runner.zig src/*.zig src/proto/*.zig src/types/*.zig
+
+      - name: Start PostgreSQL
+        run: |
+          chmod 600 tests/server.key tests/client.key
+          docker compose -f tests/compose.yml up -d
+          for i in {1..60}; do
+            if docker compose -f tests/compose.yml exec -T postgres pg_isready -U postgres; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker compose -f tests/compose.yml logs postgres
+          exit 1
+
+      - name: Run tests
+        run: zig build test --summary all -freference-trace
+
+      - name: Build package and benchmark binary
+        run: zig build --summary all
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: docker compose -f tests/compose.yml down -v
+
+  cross-build:
+    name: Cross-build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux
+          - x86_64-macos
+          - x86_64-windows
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} --summary all

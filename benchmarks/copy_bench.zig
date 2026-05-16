@@ -13,6 +13,7 @@
 //! PGPORT, PGUSER, PGDATABASE, PGPASSWORD.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const pg = @import("pg");
 
 const Row = struct {
@@ -157,6 +158,10 @@ fn nowNs() i96 {
 }
 
 fn getenv(key: []const u8) ?[]const u8 {
+    if (comptime builtin.os.tag == .windows or !builtin.link_libc) {
+        return null;
+    }
+
     var i: usize = 0;
     while (std.c.environ[i]) |entry_z| : (i += 1) {
         const entry = std.mem.span(entry_z);
