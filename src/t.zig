@@ -202,7 +202,7 @@ pub fn connect(opts: anytype) Conn {
 
     var c = Conn.open(allocator, .{
         .tls = if (@hasField(T, "tls")) opts.tls else .off,
-        .host = if (@hasField(T, "host")) opts.host else "localhost",
+        .host = if (@hasField(T, "host")) opts.host else "127.0.0.1",
         .read_buffer = if (@hasField(T, "read_buffer")) opts.read_buffer else 2000,
         .stmt_cache_max = if (@hasField(T, "stmt_cache_max")) opts.stmt_cache_max else Conn.default_stmt_cache_max,
     }) catch unreachable;
