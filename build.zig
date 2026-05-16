@@ -75,6 +75,7 @@ pub fn build(b: *std.Build) !void {
             lib_test.root_module.addIncludePath(p);
         lib_test.root_module.linkSystemLibrary("crypto", .{});
         lib_test.root_module.linkSystemLibrary("ssl", .{});
+        lib_test.root_module.link_libc = true;
 
         {
             const options = b.addOptions();
