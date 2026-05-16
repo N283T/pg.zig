@@ -25,6 +25,22 @@ pub const has_openssl = build_config.openssl;
 pub const SSLCtx = if (has_openssl) openssl.SSL_CTX else void;
 pub const default_column_names = build_config.column_names;
 
+pub fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+pub fn timestamp() i64 {
+    return std.Io.Timestamp.now(defaultIo(), .real).toSeconds();
+}
+
+pub fn nanoTimestamp() i64 {
+    return @intCast(std.Io.Timestamp.now(defaultIo(), .awake).toNanoseconds());
+}
+
+pub fn sleep(ns: u64) void {
+    defaultIo().sleep(std.Io.Duration.fromNanoseconds(@intCast(ns)), .awake) catch {};
+}
+
 const result = @import("result.zig");
 pub const Row = result.Row;
 pub const RowUnsafe = result.RowUnsafe;
@@ -179,7 +195,7 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
         }
     }
 
-    const path = std.mem.trimLeft(u8, try uri.path.toRawMaybeAlloc(aa), "/");
+    const path = std.mem.trimStart(u8, try uri.path.toRawMaybeAlloc(aa), "/");
     const host = if (uri.host) |host| try host.toRawMaybeAlloc(aa) else null;
     const username = if (uri.user) |user| try user.toRawMaybeAlloc(aa) else "postgres";
     const password = if (uri.password) |password| try password.toRawMaybeAlloc(aa) else null;
