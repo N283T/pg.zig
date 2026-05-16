@@ -28,9 +28,24 @@ jobs:
       - name: Check formatting
         run: zig fmt --check build.zig build.zig.zon example/build.zig example/main.zig benchmarks/copy_bench.zig test_runner.zig src/*.zig src/proto/*.zig src/types/*.zig
 
+      - name: Generate test TLS certificates
+        run: |
+          openssl req -days 3650 -new -text -nodes \
+            -subj '/C=SG/ST=SG/L=SG/O=Personal/OU=Personal/CN=localhost' \
+            -keyout tests/server.key -out tests/server.csr
+          openssl req -days 3650 -x509 -text -in tests/server.csr -key tests/server.key -out tests/server.crt
+          rm tests/server.csr
+          cp tests/server.crt tests/root.crt
+          openssl req -days 3650 -new -nodes \
+            -subj '/C=SG/ST=SG/L=SG/O=Personal/OU=Personal/CN=localhost/CN=testclient1' \
+            -keyout tests/client.key -out tests/client.csr
+          openssl x509 -days 3650 -req -CAcreateserial -in tests/client.csr \
+            -CA tests/root.crt -CAkey tests/server.key -out tests/client.crt
+          rm tests/client.csr
+          chmod 600 tests/server.key tests/client.key
+
       - name: Start PostgreSQL
         run: |
-          chmod 600 tests/server.key tests/client.key
           docker compose -f tests/compose.yml up -d
           for i in {1..60}; do
             if docker compose -f tests/compose.yml exec -T postgres pg_isready -U postgres; then
