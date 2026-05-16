@@ -43,6 +43,7 @@ jobs:
             -CA tests/root.crt -CAkey tests/server.key -out tests/client.crt
           rm tests/client.csr
           chmod 600 tests/server.key tests/client.key
+          sudo chown root:root tests/server.key tests/client.key
 
       - name: Start PostgreSQL
         run: |
