@@ -42,8 +42,9 @@ jobs:
           openssl x509 -days 3650 -req -CAcreateserial -in tests/client.csr \
             -CA tests/root.crt -CAkey tests/server.key -out tests/client.crt
           rm tests/client.csr
-          chmod 600 tests/server.key tests/client.key
-          sudo chown root:root tests/server.key tests/client.key
+          chmod 640 tests/server.key
+          chmod 600 tests/client.key
+          sudo chown root:999 tests/server.key
 
       - name: Start PostgreSQL
         run: |
