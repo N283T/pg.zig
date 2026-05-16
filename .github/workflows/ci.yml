@@ -46,14 +46,28 @@ jobs:
 
       - name: Start PostgreSQL
         run: |
-          docker compose -f tests/compose.yml up -d
+          docker run -d --name pgz-test --network host \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e PGDATA=/var/lib/postgresql/pgdata/ \
+            -e LANG=C.UTF-8 \
+            -v "$PWD/tests/root.crt:/etc/postgresql/root.crt:ro" \
+            -v "$PWD/tests/server.crt:/etc/postgresql/server.crt:ro" \
+            -v "$PWD/tests/server.key:/etc/postgresql/server.key:ro" \
+            -v "$PWD/tests/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro" \
+            -v "$PWD/tests/postgresql.conf:/etc/postgresql/postgresql.conf:ro" \
+            -v "$PWD/tests/init_ssl.sql:/docker-entrypoint-initdb.d/init_ssl.sql:ro" \
+            postgis/postgis \
+            postgres \
+            -c config_file=/etc/postgresql/postgresql.conf \
+            -c hba_file=/etc/postgresql/pg_hba.conf
           for i in {1..60}; do
-            if docker compose -f tests/compose.yml exec -T postgres pg_isready -U postgres; then
+            if docker exec pgz-test pg_isready -h 127.0.0.1 -U postgres; then
               exit 0
             fi
             sleep 1
           done
-          docker compose -f tests/compose.yml logs postgres
+          docker logs pgz-test
           exit 1
 
       - name: Run tests
@@ -64,7 +78,7 @@ jobs:
 
       - name: Stop PostgreSQL
         if: always()
-        run: docker compose -f tests/compose.yml down -v
+        run: docker rm -f pgz-test
 
   cross-build:
     name: Cross-build (${{ matrix.target }})
