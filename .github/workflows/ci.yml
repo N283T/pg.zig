@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Zig 0.16 tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Show Zig version
+        run: zig version
+
+      - name: Check formatting
+        run: zig fmt --check build.zig build.zig.zon example/build.zig example/main.zig benchmarks/copy_bench.zig test_runner.zig src/*.zig src/proto/*.zig src/types/*.zig
+
+      - name: Generate test TLS certificates
+        run: |
+          openssl req -days 3650 -new -text -nodes \
+            -subj '/C=SG/ST=SG/L=SG/O=Personal/OU=Personal/CN=localhost' \
+            -keyout tests/server.key -out tests/server.csr
+          openssl req -days 3650 -x509 -text -in tests/server.csr -key tests/server.key -out tests/server.crt
+          rm tests/server.csr
+          cp tests/server.crt tests/root.crt
+          openssl req -days 3650 -new -nodes \
+            -subj '/C=SG/ST=SG/L=SG/O=Personal/OU=Personal/CN=localhost/CN=testclient1' \
+            -keyout tests/client.key -out tests/client.csr
+          openssl x509 -days 3650 -req -CAcreateserial -in tests/client.csr \
+            -CA tests/root.crt -CAkey tests/server.key -out tests/client.crt
+          rm tests/client.csr
+          chmod 640 tests/server.key
+          chmod 600 tests/client.key
+          sudo chown root:999 tests/server.key
+
+      - name: Start PostgreSQL
+        run: |
+          docker run -d --name pgz-test --network host \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e PGDATA=/var/lib/postgresql/pgdata/ \
+            -e LANG=C.UTF-8 \
+            -v "$PWD/tests/root.crt:/etc/postgresql/root.crt:ro" \
+            -v "$PWD/tests/server.crt:/etc/postgresql/server.crt:ro" \
+            -v "$PWD/tests/server.key:/etc/postgresql/server.key:ro" \
+            -v "$PWD/tests/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro" \
+            -v "$PWD/tests/postgresql.conf:/etc/postgresql/postgresql.conf:ro" \
+            -v "$PWD/tests/init_ssl.sql:/docker-entrypoint-initdb.d/init_ssl.sql:ro" \
+            postgis/postgis \
+            postgres \
+            -c config_file=/etc/postgresql/postgresql.conf \
+            -c hba_file=/etc/postgresql/pg_hba.conf
+          for i in {1..60}; do
+            if docker exec pgz-test pg_isready -h 127.0.0.1 -U postgres; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs pgz-test
+          exit 1
+
+      - name: Run tests
+        run: zig build test --summary all -freference-trace
+
+      - name: Build package and benchmark binary
+        run: zig build --summary all
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: docker rm -f pgz-test
+
+  cross-build:
+    name: Cross-build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux
+          - x86_64-macos
+          - x86_64-windows
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} --summary all

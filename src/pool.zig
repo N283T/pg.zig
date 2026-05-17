@@ -10,6 +10,7 @@ const QueryRowUnsafe = lib.QueryRowUnsafe;
 const Listener = @import("listener.zig").Listener;
 
 const Thread = std.Thread;
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 pub const Pool = struct {
@@ -19,8 +20,8 @@ pub const Pool = struct {
     _available: usize,
     _missing: usize,
     _allocator: Allocator,
-    _mutex: Thread.Mutex,
-    _cond: Thread.Condition,
+    _mutex: Io.Mutex,
+    _cond: Io.Condition,
     _ssl_ctx: ?*lib.SSLCtx,
     _reconnector: Reconnector,
     _arena: std.heap.ArenaAllocator,
@@ -84,8 +85,8 @@ pub const Pool = struct {
         const connect_on_init_count = opts.connect_on_init_count orelse size;
 
         pool.* = .{
-            ._cond = .{},
-            ._mutex = .{},
+            ._cond = .init,
+            ._mutex = .init,
             ._conns = conns,
             ._arena = arena,
             ._opts = opts_copy,
@@ -131,10 +132,10 @@ pub const Pool = struct {
 
     pub fn acquire(self: *Pool) !*Conn {
         const conns = self._conns;
-        const deadline = std.time.nanoTimestamp() + @as(i64, @intCast(self._timeout));
+        const deadline = lib.nanoTimestamp() + @as(i64, @intCast(self._timeout));
 
-        self._mutex.lock();
-        errdefer self._mutex.unlock();
+        self._mutex.lockUncancelable(self._opts.connect.io);
+        errdefer self._mutex.unlock(self._opts.connect.io);
 
         while (true) {
             const available = self._available;
@@ -150,20 +151,22 @@ pub const Pool = struct {
                 lib.metrics.poolEmpty();
 
                 // Calculate remaining timeout
-                const now = std.time.nanoTimestamp();
+                const now = lib.nanoTimestamp();
                 if (now >= deadline) {
                     return error.Timeout;
                 }
                 const remaining_ns: u64 = @intCast(deadline - now);
 
-                try self._cond.timedWait(&self._mutex, remaining_ns);
+                self._mutex.unlock(self._opts.connect.io);
+                lib.sleep(@min(remaining_ns, std.time.ns_per_ms));
+                self._mutex.lockUncancelable(self._opts.connect.io);
                 continue;
             }
 
             const index = available - 1;
             const conn = conns[index];
             self._available = index;
-            self._mutex.unlock();
+            self._mutex.unlock(self._opts.connect.io);
             return conn;
         }
     }
@@ -194,9 +197,9 @@ pub const Pool = struct {
             conn_to_add = newConnection(self, true) catch |err1| {
                 // we failed to create the connection, track it as missing and let
                 // the background reconnector try
-                self._mutex.lock();
+                self._mutex.lockUncancelable(self._opts.connect.io);
                 self._missing += 1;
-                self._mutex.unlock();
+                self._mutex.unlock(self._opts.connect.io);
 
                 self._reconnector.reconnect() catch |err2| {
                     log.err("Re-opening connection failed ({}) and background reconnector failed to start ({})", .{ err1, err2 });
@@ -206,12 +209,12 @@ pub const Pool = struct {
         }
 
         var conns = self._conns;
-        self._mutex.lock();
+        self._mutex.lockUncancelable(self._opts.connect.io);
         const available = self._available;
         conns[available] = conn_to_add;
         self._available = available + 1;
-        self._mutex.unlock();
-        self._cond.signal();
+        self._mutex.unlock(self._opts.connect.io);
+        self._cond.signal(self._opts.connect.io);
     }
 
     pub fn newListener(self: *Pool) !Listener {
@@ -221,8 +224,8 @@ pub const Pool = struct {
     }
 
     pub fn stats(self: *Pool) Stats {
-        self._mutex.lock();
-        defer self._mutex.unlock();
+        self._mutex.lockUncancelable(self._opts.connect.io);
+        defer self._mutex.unlock(self._opts.connect.io);
 
         const available = self._available;
         const missing = self._missing;
@@ -290,7 +293,7 @@ const Reconnector = struct {
     stopped: bool,
 
     pool: *Pool,
-    mutex: Thread.Mutex,
+    mutex: Io.Mutex,
 
     // the thread, if any, that the monitor is running in
     thread: ?Thread,
@@ -299,7 +302,7 @@ const Reconnector = struct {
         return .{
             .pool = pool,
             .count = 0,
-            .mutex = .{},
+            .mutex = .init,
             .stopped = false,
             .thread = null,
         };
@@ -309,29 +312,29 @@ const Reconnector = struct {
         const pool = self.pool;
         const retry_delay = 2 * std.time.ns_per_s;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.pool._opts.connect.io);
+        defer self.mutex.unlock(self.pool._opts.connect.io);
         loop: while (self.count > 0) {
             const stopped = self.stopped;
-            self.mutex.unlock();
+            self.mutex.unlock(self.pool._opts.connect.io);
             if (stopped == true) {
                 return;
             }
 
             const conn = newConnection(pool, false) catch {
-                std.Thread.sleep(retry_delay);
-                self.mutex.lock();
+                lib.sleep(retry_delay);
+                self.mutex.lockUncancelable(self.pool._opts.connect.io);
                 continue :loop;
             };
 
             // Decrement missing count when successfully recreated
-            pool._mutex.lock();
+            pool._mutex.lockUncancelable(pool._opts.connect.io);
             std.debug.assert(pool._missing > 0);
             pool._missing -= 1;
-            pool._mutex.unlock();
+            pool._mutex.unlock(pool._opts.connect.io);
 
             conn.release(); // inserts it into the pool
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.pool._opts.connect.io);
             self.count -= 1;
         }
 
@@ -340,17 +343,17 @@ const Reconnector = struct {
     }
 
     fn stop(self: *Reconnector) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.pool._opts.connect.io);
         self.stopped = true;
-        self.mutex.unlock();
+        self.mutex.unlock(self.pool._opts.connect.io);
         if (self.thread) |thrd| {
             thrd.join();
         }
     }
 
     fn reconnect(self: *Reconnector) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.pool._opts.connect.io);
+        defer self.mutex.unlock(self.pool._opts.connect.io);
         self.count += 1;
         if (self.thread == null) {
             self.thread = try Thread.spawn(.{ .stack_size = 1024 * 1024 }, Reconnector.run, .{self});

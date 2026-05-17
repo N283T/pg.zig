@@ -13,6 +13,7 @@
 //! PGPORT, PGUSER, PGDATABASE, PGPASSWORD.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const pg = @import("pg");
 
 const Row = struct {
@@ -24,7 +25,7 @@ const Row = struct {
 const SIZES = [_]usize{ 1_000, 10_000, 100_000 };
 
 pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -34,7 +35,7 @@ pub fn main() !void {
     // BENCH_COPY_ONLY=1 skips the (slow) exec_in_tx baseline so the
     // binary can be wrapped by hyperfine alongside the pgx / rust-postgres
     // benches (which only measure COPY).
-    const copy_only = std.posix.getenv("BENCH_COPY_ONLY") != null;
+    const copy_only = getenv("BENCH_COPY_ONLY") != null;
 
     var conn = try pg.Conn.openAndAuth(allocator, cfg.connect, cfg.auth);
     defer conn.deinit();
@@ -80,7 +81,7 @@ pub fn main() !void {
 fn runInsertInTx(conn: *pg.Conn, rows: []const Row) !u64 {
     try truncate(conn);
 
-    var timer = try std.time.Timer.start();
+    const start = nowNs();
     try conn.begin();
     errdefer conn.rollback() catch {};
     for (rows) |r| {
@@ -90,16 +91,16 @@ fn runInsertInTx(conn: *pg.Conn, rows: []const Row) !u64 {
         );
     }
     try conn.commit();
-    return timer.read();
+    return @intCast(nowNs() - start);
 }
 
 fn runCopy(conn: *pg.Conn, rows: []const Row) !u64 {
     try truncate(conn);
 
-    var timer = try std.time.Timer.start();
+    const start = nowNs();
     const n = try conn.copyIntoTable("bench_copy", rows);
     std.debug.assert(n == @as(i64, @intCast(rows.len)));
-    return timer.read();
+    return @intCast(nowNs() - start);
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -126,10 +127,10 @@ fn buildRows(allocator: std.mem.Allocator, n: usize) ![]Row {
     // per-row allocation time. Representative enough for a mix of short
     // and medium-length text columns.
     const names = [_][]const u8{
-        "alice",      "bob",       "carol",   "daniel",
-        "ellen",      "francesco", "gina",    "hiroshi",
-        "ingrid",     "junpei",    "kenji",   "louisa",
-        "maribel",    "natalia",   "ogawa",   "priscilla",
+        "alice",                                "bob",       "carol", "daniel",
+        "ellen",                                "francesco", "gina",  "hiroshi",
+        "ingrid",                               "junpei",    "kenji", "louisa",
+        "maribel",                              "natalia",   "ogawa", "priscilla",
         "some-longer-name-just-to-vary-widths", "short",
     };
     for (rows, 0..) |*r, i| {
@@ -152,6 +153,25 @@ fn reportRow(size: usize, label: []const u8, ns: u64, relative: f64) void {
     );
 }
 
+fn nowNs() i96 {
+    return std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake).toNanoseconds();
+}
+
+fn getenv(key: []const u8) ?[]const u8 {
+    if (comptime builtin.os.tag == .windows or !builtin.link_libc) {
+        return null;
+    }
+
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry_z| : (i += 1) {
+        const entry = std.mem.span(entry_z);
+        if (entry.len > key.len and entry[key.len] == '=' and std.mem.eql(u8, entry[0..key.len], key)) {
+            return entry[key.len + 1 ..];
+        }
+    }
+    return null;
+}
+
 // ---- connection config from env --------------------------------------------
 
 const Config = struct {
@@ -171,15 +191,12 @@ const Config = struct {
 };
 
 fn readEnvConfig(allocator: std.mem.Allocator) !Config {
-    var env = try std.process.getEnvMap(allocator);
-    defer env.deinit();
+    const host = getenv("PGHOST");
+    const user = getenv("PGUSER") orelse "postgres";
+    const db = getenv("PGDATABASE") orelse "postgres";
+    const pass = getenv("PGPASSWORD");
 
-    const host = env.get("PGHOST");
-    const user = env.get("PGUSER") orelse "postgres";
-    const db = env.get("PGDATABASE") orelse "postgres";
-    const pass = env.get("PGPASSWORD");
-
-    const port: u16 = if (env.get("PGPORT")) |p|
+    const port: u16 = if (getenv("PGPORT")) |p|
         std.fmt.parseInt(u16, p, 10) catch 5432
     else
         5432;

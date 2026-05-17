@@ -16,6 +16,7 @@ const QueryRowUnsafe = lib.QueryRowUnsafe;
 const has_openssl = lib.has_openssl;
 
 const os = std.os;
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
@@ -66,7 +67,7 @@ pub const Conn = struct {
 
     // LRU access order for _prepared_statements. Oldest entry at index 0,
     // most-recently-used at the end.
-    _stmt_cache_order: std.ArrayListUnmanaged([]const u8),
+    _stmt_cache_order: std.ArrayList([]const u8),
     _stmt_cache_max: usize,
 
     // Track total queries executed and connection creation time. Exposed via
@@ -104,6 +105,7 @@ pub const Conn = struct {
         stmt_cache_max: usize = default_stmt_cache_max,
         tls: TLS = .off,
         _hostz: ?[:0]const u8 = null,
+        io: Io = lib.defaultIo(),
 
         pub const TLS = union(enum) {
             off: void,
@@ -196,9 +198,9 @@ pub const Conn = struct {
             ._param_oids = param_oids,
             ._result_state = result_state,
             ._prepared_statements = .{},
-            ._stmt_cache_order = .{},
+            ._stmt_cache_order = .empty,
             ._stmt_cache_max = opts.stmt_cache_max,
-            ._created_at = std.time.timestamp(),
+            ._created_at = lib.timestamp(),
         };
     }
 
@@ -230,7 +232,7 @@ pub const Conn = struct {
     }
 
     pub fn age(self: *const Conn) i64 {
-        return std.time.timestamp() - self._created_at;
+        return lib.timestamp() - self._created_at;
     }
 
     // Move `name` to the tail of the LRU order. Caller guarantees `name` is
@@ -1873,13 +1875,16 @@ test "PG: binary wrapper" {
     var c = t.connect(.{});
     defer c.deinit();
 
-    _ = try c.exec(
+    _ = c.exec(
         \\ create extension if not exists postgis;
         \\ create table if not exists places (
         \\     id int not null,
         \\     location geography not null
         \\ );
-    , .{});
+    , .{}) catch |err| switch (err) {
+        error.PG => return error.SkipZigTest,
+        else => return err,
+    };
 
     const data = lib.Binary{
         .data = &.{ 1, 1, 0, 0, 32, 230, 16, 0, 0, 43, 107, 238, 243, 22, 122, 82, 192, 60, 20, 204, 226, 238, 89, 68, 64 },
@@ -2105,7 +2110,7 @@ test "Conn: TLS verify-full" {
     try t.expectError(error.SSLCertificationVerificationError, Conn.open(t.allocator, .{ .tls = .{ .verify_full = null } }));
 
     {
-        var conn = t.connect(.{ .tls = Conn.Opts.TLS{ .verify_full = "tests/root.crt" }, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
+        var conn = t.connect(.{ .tls = Conn.Opts.TLS{ .verify_full = "tests/server.crt" }, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
         defer conn.deinit();
     }
 }

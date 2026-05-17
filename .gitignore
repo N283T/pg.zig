@@ -12,3 +12,5 @@ tests/server.key
 benchmarks/pgx_bench/pgx_bench
 benchmarks/rust_bench/target/
 benchmarks/hyperfine-results.md
+
+zig-pkg/
