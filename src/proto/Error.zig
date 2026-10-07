@@ -61,7 +61,9 @@ pub fn parse(data: []const u8) Error {
             'F' => err.file = value,
             'L' => err.line = value,
             'R' => err.routine = value,
-            else => unreachable,
+            // "Since more field types might be added in future, frontends should
+            // silently ignore fields of unrecognized type."
+            else => {},
         }
         pos = value_end + 1;
     }
@@ -123,5 +125,33 @@ test "Error: parse" {
         try t.expectString("F-value", err.file.?);
         try t.expectString("L-value", err.line.?);
         try t.expectString("R-value", err.routine.?);
+    }
+
+    {
+        // unknown fields are ignored
+        buf.reset();
+        try buf.writeByte('S');
+        try buf.write("ERROR");
+        try buf.writeByte(0);
+
+        try buf.writeByte('?');
+        try buf.write("unknown");
+        try buf.writeByte(0);
+
+        try buf.writeByte('C');
+        try buf.write("55P03");
+        try buf.writeByte(0);
+
+        try buf.writeByte('M');
+        try buf.write("The Message");
+        try buf.writeByte(0);
+
+        // message terminator
+        try buf.writeByte(0);
+
+        const err = Error.parse(buf.string());
+        try t.expectString("ERROR", err.severity);
+        try t.expectString("55P03", err.code);
+        try t.expectString("The Message", err.message);
     }
 }

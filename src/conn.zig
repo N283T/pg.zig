@@ -639,8 +639,12 @@ pub const Conn = struct {
     // Should not be called directly
     pub fn peekForError(self: *Conn) !void {
         const data = (try self._reader.peekForError()) orelse return;
+
+        // data references the reader's buffer, which readyForQuery is going to
+        // read into. setErr takes its own copy, so it has to come first.
+        const err = self.setErr(data);
         try self.readyForQuery();
-        return self.setErr(data);
+        return err;
     }
 
     // Should not be called directly
@@ -2084,6 +2088,43 @@ test "PG: rollback during error" {
 
     try t.expectEqual(3001, (try result.next()).?.get(i32, 0));
     try t.expectEqual(null, (try result.next()));
+}
+
+test "PG: error on execute" {
+    var holder = t.connect(.{});
+    defer holder.deinit();
+
+    _ = try holder.exec("insert into all_types (id) values ($1)", .{4000});
+    try holder.begin();
+    defer holder.rollback() catch {};
+    _ = try holder.exec("select id from all_types where id = 4000 for update", .{});
+
+    const sql = "select id from all_types where id = 4000 for update";
+
+    // The row is locked by holder, so the lock timeout is only raised once the
+    // statement is executed. The server sends the ErrorResponse and the
+    // ReadyForQuery separately, the error has to survive reading the latter.
+    // A small read_buffer has the reader assemble the error in a dynamic buffer.
+    inline for (.{ 2000, 100 }) |read_buffer| {
+        var c = t.connect(.{ .read_buffer = read_buffer });
+        defer c.deinit();
+        _ = try c.exec("set lock_timeout = '100ms'", .{});
+
+        try t.expectError(error.PG, c.query(sql, .{}));
+        try t.expectString("55P03", c.err.?.code);
+        try t.expectString("ERROR", c.err.?.severity);
+        try t.expectString("canceling statement due to lock timeout", c.err.?.message);
+
+        // conn is still usable
+        try t.expectEqual(4, t.scalar(&c, "select 4"));
+
+        // same thing within a transaction
+        try c.begin();
+        try t.expectError(error.PG, c.query(sql, .{}));
+        try t.expectString("55P03", c.err.?.code);
+        try c.rollback();
+        try t.expectEqual(5, t.scalar(&c, "select 5"));
+    }
 }
 
 test "open URI" {
