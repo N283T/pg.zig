@@ -160,6 +160,33 @@ pub fn CopyIn(comptime ColumnTypes: anytype) type {
             }
         }
 
+        /// Append rows that are already encoded in the binary COPY tuple
+        /// layout: a big-endian i16 field count, then for each field a
+        /// big-endian i32 byte length followed by that many bytes, or the
+        /// length -1 and no bytes for NULL. The bytes are sent unchanged and
+        /// `ColumnTypes` is not consulted, so the caller is responsible for
+        /// matching the COPY's column list; `copyIn(sql, .{})` opens a COPY
+        /// that is only written this way. A call may end in the middle of a
+        /// tuple as long as later calls complete it before `finish`.
+        pub fn writeTuples(self: *Self, tuples: []const u8) !void {
+            if (self._state != .active) return error.CopyInClosed;
+            // Same reasoning as writeRow: a failure part-way leaves the wire
+            // in an indeterminate state.
+            errdefer self._state = .failed;
+            var rest = tuples;
+            while (rest.len != 0) {
+                // Fill the buffer up to the threshold rather than growing it
+                // to the size of the caller's data.
+                const room = self._opts.flush_threshold -| self._buf.len();
+                const chunk = rest[0..@min(rest.len, @max(room, 1))];
+                rest = rest[chunk.len..];
+                try self._buf.write(chunk);
+                if (self._buf.len() >= self._opts.flush_threshold) {
+                    try self.flush();
+                }
+            }
+        }
+
         pub fn flush(self: *Self) !void {
             if (self._buf.len() == 0) return;
             const cd = proto.CopyData{ .payload = self._buf.string() };
@@ -1005,4 +1032,96 @@ test "CopyIn: copyInOpts with tiny flush_threshold flushes per row" {
     _ = try result.next();
 
     _ = try conn.exec("drop table copy_test_tiny_flush", .{});
+}
+
+test "CopyIn.writeTuples: pre-encoded tuples are sent unchanged" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_tuples", .{});
+    _ = try conn.exec("create table copy_test_tuples (id int4 not null, name text)", .{});
+
+    // Encode three rows the way writeRow would, without the COPY header.
+    var encoded = try Buffer.init(t.allocator, 128);
+    defer encoded.deinit();
+    const Cols = .{ i32, ?[]const u8 };
+    try writeRowInto(Cols, &encoded, .{ @as(i32, 1), @as(?[]const u8, "alice") });
+    try writeRowInto(Cols, &encoded, .{ @as(i32, 2), @as(?[]const u8, null) });
+    try writeRowInto(Cols, &encoded, .{ @as(i32, 3), @as(?[]const u8, "carol") });
+    const bytes = encoded.string();
+
+    {
+        var copy = try conn.copyIn("copy copy_test_tuples (id, name) from stdin binary", .{});
+        defer copy.deinit();
+        // A call may stop in the middle of a tuple.
+        try copy.writeTuples(bytes[0..5]);
+        try copy.writeTuples(bytes[5..]);
+        try copy.writeTuples("");
+        try t.expectEqual(@as(i64, 3), try copy.finish());
+        try t.expectError(error.CopyInClosed, copy.writeTuples(bytes));
+    }
+
+    // Typed rows and pre-encoded tuples can share one COPY.
+    {
+        var copy = try conn.copyIn("copy copy_test_tuples (id, name) from stdin binary", Cols);
+        defer copy.deinit();
+        try copy.writeRow(.{ @as(i32, 4), @as(?[]const u8, "dave") });
+        try copy.writeTuples(bytes);
+        try t.expectEqual(@as(i64, 4), try copy.finish());
+    }
+
+    var result = try conn.queryOpts(
+        "select count(*)::int4, count(name)::int4, sum(id)::int4 from copy_test_tuples",
+        .{},
+        .{},
+    );
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(@as(i32, 7), try row.get(i32, 0));
+    try t.expectEqual(@as(i32, 5), try row.get(i32, 1));
+    try t.expectEqual(@as(i32, 16), try row.get(i32, 2));
+    try t.expectEqual(null, try result.next());
+
+    _ = try conn.exec("drop table copy_test_tuples", .{});
+}
+
+test "CopyIn.writeTuples: data larger than the flush threshold is sent in pieces" {
+    var conn = t.connect(.{});
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists copy_test_tuples_big", .{});
+    _ = try conn.exec("create table copy_test_tuples_big (n int4 not null)", .{});
+
+    var encoded = try Buffer.init(t.allocator, 1024);
+    defer encoded.deinit();
+    var i: i32 = 0;
+    while (i < 50_000) : (i += 1) {
+        try writeRowInto(.{i32}, &encoded, .{i});
+    }
+
+    {
+        var copy = try conn.copyInOpts(
+            "copy copy_test_tuples_big (n) from stdin binary",
+            .{},
+            .{ .flush_threshold = 4096 },
+        );
+        defer copy.deinit();
+        try copy.writeTuples(encoded.string());
+        // The buffer never grows to the size of the data.
+        try t.expectEqual(true, copy._buf.len() < 4096);
+        try t.expectEqual(@as(i64, 50_000), try copy.finish());
+    }
+
+    var result = try conn.queryOpts(
+        "select count(*)::int4, sum(n)::int8 from copy_test_tuples_big",
+        .{},
+        .{},
+    );
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(@as(i32, 50_000), try row.get(i32, 0));
+    try t.expectEqual(@as(i64, 1_249_975_000), try row.get(i64, 1));
+    try t.expectEqual(null, try result.next());
+
+    _ = try conn.exec("drop table copy_test_tuples_big", .{});
 }
