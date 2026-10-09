@@ -427,6 +427,21 @@ exceeds 64 KiB (configurable via `copyInOpts(..., .{ .flush_threshold = N })`).
 Forgetting to call `finish` causes `deinit` to send `CopyFail`, which
 PostgreSQL treats as an abort — no rows are committed.
 
+Rows that are already encoded in the binary COPY tuple layout (an `i16` field
+count, then per field an `i32` byte length, or -1 for NULL, and the bytes) can
+be sent unchanged with `writeTuples`. This is for callers whose column types
+are only known at run time, or who encode rows on other threads:
+
+```zig
+var copy = try conn.copyIn("copy users (id, name) from stdin binary", .{});
+defer copy.deinit();
+try copy.writeTuples(encoded_rows);
+const affected = try copy.finish();
+```
+
+`writeTuples` does not check the bytes against the column list; PostgreSQL
+reports a mismatch when the COPY finishes.
+
 `copyIntoTable` wraps the table name and each field name in double quotes, but it does NOT escape any `"` inside them. Pass `table` as a literal or pre-sanitize it — do not interpolate unchecked user input here. For dynamic schema/table selection, prefer `copyInto` with a caller-constructed SQL string.
 
 Supported column types are the same primitive set the parameter-bind path
