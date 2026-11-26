@@ -39,11 +39,8 @@ fn writeFooter(buf: *Buffer) !void {
     try buf.writeIntBig(i16, -1);
 }
 
-fn fieldTypesValue(comptime Row: type) [std.meta.fields(Row).len]type {
-    const fields = std.meta.fields(Row);
-    var arr: [fields.len]type = undefined;
-    inline for (fields, 0..) |f, i| arr[i] = f.type;
-    return arr;
+fn fieldTypesValue(comptime Row: type) [@typeInfo(Row).@"struct".field_types.len]type {
+    return @typeInfo(Row).@"struct".field_types[0..].*;
 }
 
 pub fn copyIntoImpl(conn: *Conn, sql: []const u8, rows: anytype, opts: CopyOpts) !i64 {
@@ -64,16 +61,16 @@ pub fn copyIntoImpl(conn: *Conn, sql: []const u8, rows: anytype, opts: CopyOpts)
         @compileError("copyInto expects a slice or array of structs, got " ++ @typeName(Slice));
     };
     const ColumnTypes = comptime fieldTypesValue(Row);
-    const TupleT = comptime std.meta.Tuple(&ColumnTypes);
+    const TupleT = comptime @Tuple(&ColumnTypes);
 
     var copy = try conn.copyInOpts(sql, ColumnTypes, opts);
     defer copy.deinit();
 
-    const fields = comptime std.meta.fields(Row);
+    const field_names = comptime @typeInfo(Row).@"struct".field_names;
     for (rows) |row| {
         var tuple: TupleT = undefined;
-        inline for (fields, 0..) |f, i| {
-            tuple[i] = @field(row, f.name);
+        inline for (field_names, 0..) |name, i| {
+            tuple[i] = @field(row, name);
         }
         try copy.writeRow(tuple);
     }
@@ -82,14 +79,14 @@ pub fn copyIntoImpl(conn: *Conn, sql: []const u8, rows: anytype, opts: CopyOpts)
 }
 
 fn buildCopySql(allocator: Allocator, table: []const u8, comptime Row: type) ![]u8 {
-    const fields = std.meta.fields(Row);
+    const field_names = @typeInfo(Row).@"struct".field_names;
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(allocator);
 
     try list.print(allocator, "copy \"{s}\" (", .{table});
-    inline for (fields, 0..) |f, i| {
+    inline for (field_names, 0..) |name, i| {
         if (i > 0) try list.appendSlice(allocator, ", ");
-        try list.print(allocator, "\"{s}\"", .{f.name});
+        try list.print(allocator, "\"{s}\"", .{name});
     }
     try list.appendSlice(allocator, ") from stdin binary");
     return list.toOwnedSlice(allocator);

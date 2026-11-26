@@ -146,10 +146,11 @@ pub const Result = struct {
     };
 
     pub fn mapper(self: *Result, comptime T: type, opts: MapperOpts) Mapper(T) {
-        var column_indexes: [std.meta.fields(T).len]?usize = undefined;
+        const fnames = @typeInfo(T).@"struct".field_names;
+        var column_indexes: [fnames.len]?usize = undefined;
 
-        inline for (std.meta.fields(T), 0..) |field, i| {
-            column_indexes[i] = self.columnIndex(field.name);
+        inline for (fnames, 0..) |fname, i| {
+            column_indexes[i] = self.columnIndex(fname);
         }
 
         // if we're given an allocator, use that.
@@ -366,23 +367,32 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
 
         fn toUsingOrdinal(self: *const Self, T: type, allocator: ?Allocator) !T {
             var value: T = undefined;
-            inline for (std.meta.fields(T), 0..) |field, column_index| {
-                @field(value, field.name) = try self.mapColumn(field, column_index, allocator);
+            const SI = @typeInfo(T).@"struct";
+            inline for (SI.field_names, SI.field_types, SI.field_attrs, 0..) |fname, ftype, fattr, column_index| {
+                @field(value, fname) = try self.mapColumn(.{
+                    .name = fname,
+                    .type = ftype,
+                    .default_value_ptr = fattr.default_value_ptr,
+                }, column_index, allocator);
             }
             return value;
         }
 
         fn toUsingName(self: *const Self, T: type, allocator: ?Allocator) !T {
             var value: T = undefined;
+            const SI = @typeInfo(T).@"struct";
             const result = self._result;
-            inline for (std.meta.fields(T)) |field| {
-                const name = field.name;
-                @field(value, name) = try self.mapColumn(field, result.columnIndex(name), allocator);
+            inline for (SI.field_names, SI.field_types, SI.field_attrs) |fname, ftype, fattr| {
+                @field(value, fname) = try self.mapColumn(.{
+                    .name = fname,
+                    .type = ftype,
+                    .default_value_ptr = fattr.default_value_ptr,
+                }, result.columnIndex(fname), allocator);
             }
             return value;
         }
 
-        fn mapColumn(self: *const Self, comptime field: std.builtin.Type.StructField, optional_column_index: ?usize, allocator: ?Allocator) !field.type {
+        fn mapColumn(self: *const Self, comptime field: StructField, optional_column_index: ?usize, allocator: ?Allocator) !field.type {
             const T = field.type;
             const column_index = optional_column_index orelse {
                 if (field.default_value_ptr) |dflt| {
@@ -447,11 +457,20 @@ fn mapValue(comptime T: type, value: T, allocator: Allocator) !T {
     return value;
 }
 
+// The parts of a struct field that mapColumn needs. Zig 0.17 stores struct
+// reflection as parallel arrays, so callers assemble this per field.
+const StructField = struct {
+    name: [:0]const u8,
+    type: type,
+    default_value_ptr: ?*const anyopaque = null,
+};
+
 pub fn Mapper(comptime T: type) type {
+    const SI = @typeInfo(T).@"struct";
     return struct {
         result: *Result,
         allocator: ?Allocator,
-        column_indexes: [std.meta.fields(T).len]?usize,
+        column_indexes: [SI.field_names.len]?usize,
 
         const Self = @This();
 
@@ -461,8 +480,12 @@ pub fn Mapper(comptime T: type) type {
             var value: T = undefined;
 
             const allocator = self.allocator;
-            inline for (std.meta.fields(T), self.column_indexes) |field, optional_column_index| {
-                @field(value, field.name) = try row.mapColumn(field, optional_column_index, allocator);
+            inline for (SI.field_names, SI.field_types, SI.field_attrs, self.column_indexes) |fname, ftype, fattr, optional_column_index| {
+                @field(value, fname) = try row.mapColumn(.{
+                    .name = fname,
+                    .type = ftype,
+                    .default_value_ptr = fattr.default_value_ptr,
+                }, optional_column_index, allocator);
             }
             return value;
         }
@@ -556,7 +579,7 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
         }
 
         // used internally by row.get(Iterator(T))
-        fn fromPgzRow(value: Result.State.Value, oid: i32) !Self {
+        pub fn fromPgzRow(value: Result.State.Value, oid: i32) !Self {
             const data = value.data;
             const TT = switch (@typeInfo(T)) {
                 .optional => |opt| opt.child,
