@@ -7,6 +7,20 @@ pub fn build(b: *std.Build) !void {
     // setup our dependencies
     const dep_opts = .{ .target = target, .optimize = optimize };
 
+    const openssl_lib_name = b.option([]const u8, "openssl_lib_name", "");
+    const openssl_lib_path = b.option(std.Build.LazyPath, "openssl_lib_path", "");
+    const openssl_include_path = b.option(std.Build.LazyPath, "openssl_include_path", "");
+    const openssl = b.option(bool, "openssl", "Enable OpenSSL/TLS support") orelse
+        (openssl_lib_name != null or openssl_lib_path != null or openssl_include_path != null);
+
+    // Zig 0.17 removed @cImport. When openssl is enabled, translate its
+    // headers with the translate-c package; otherwise use an empty stub so
+    // the build does not need <openssl/ssl.h> at all.
+    const openssl_module = if (openssl)
+        translateOpenssl(b, target, optimize, openssl_include_path)
+    else
+        b.createModule(.{ .root_source_file = b.path("src/openssl_stub.zig") });
+
     // Expose this as a module that others can import
     const pg_module = b.addModule("pg", .{
         .target = target,
@@ -15,27 +29,12 @@ pub fn build(b: *std.Build) !void {
         .imports = &.{
             .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
             .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
+            .{ .name = "openssl", .module = openssl_module },
         },
     });
 
-    var openssl = false;
-    const openssl_lib_name = b.option([]const u8, "openssl_lib_name", "");
-    const openssl_lib_path = b.option(std.Build.LazyPath, "openssl_lib_path", "");
-    const openssl_include_path = b.option(std.Build.LazyPath, "openssl_include_path", "");
-
-    if (openssl_include_path) |p| {
-        openssl = true;
-        pg_module.addIncludePath(p);
-    }
-    if (openssl_lib_path) |p| {
-        openssl = true;
-        pg_module.addLibraryPath(p);
-    }
-    if (openssl_lib_name != null) {
-        openssl = true;
-    }
-
     if (openssl) {
+        if (openssl_lib_path) |p| pg_module.addLibraryPath(p);
         pg_module.linkSystemLibrary("crypto", .{});
         pg_module.linkSystemLibrary(openssl_lib_name orelse "ssl", .{});
         pg_module.link_libc = true;
@@ -65,14 +64,14 @@ pub fn build(b: *std.Build) !void {
                 .imports = &.{
                     .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
                     .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
+                    .{ .name = "openssl", .module = translateOpenssl(b, target, optimize, openssl_include_path) },
                 },
             }),
+            .use_llvm = true,
             .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         });
         if (openssl_lib_path) |p|
             lib_test.root_module.addLibraryPath(p);
-        if (openssl_include_path) |p|
-            lib_test.root_module.addIncludePath(p);
         lib_test.root_module.linkSystemLibrary("crypto", .{});
         lib_test.root_module.linkSystemLibrary("ssl", .{});
         lib_test.root_module.link_libc = true;
@@ -114,9 +113,25 @@ pub fn build(b: *std.Build) !void {
 
         const run_bench = b.addRunArtifact(bench_exe);
         run_bench.has_side_effects = true;
-        if (b.args) |args| run_bench.addArgs(args);
+        run_bench.addPassthruArgs();
 
         const bench_step = b.step("bench", "Run COPY vs INSERT benchmark");
         bench_step.dependOn(&run_bench.step);
     }
+}
+
+fn translateOpenssl(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    include_path: ?std.Build.LazyPath,
+) *std.Build.Module {
+    const Translator = @import("translate_c").Translator;
+    const t: Translator = .init(b.dependency("translate_c", .{}), .{
+        .c_source_file = b.path("src/openssl.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (include_path) |p| t.addIncludePath(p);
+    return t.mod;
 }

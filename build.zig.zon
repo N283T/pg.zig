@@ -9,8 +9,12 @@
             .hash = "N-V-__8AAEGLAACZXqfn1yrAh1MKBAy7tUw-fQIEFU9bopsi",
         },
         .metrics = .{
-            .url = "https://github.com/karlseguin/metrics.zig/archive/1621f82e7ecf2b3dddf5730bf52761af354a7080.tar.gz",
-            .hash = "metrics-0.0.0-W7G4eJOgAQDBacPAeqGCaY8gV7zuddUQyikGNq7nDPds",
+            .url = "git+https://github.com/karlseguin/metrics.zig#ac167295b6a8fd84ca7af852c1032e6b246101f0",
+            .hash = "metrics-0.0.0-W7G4eGWhAQC-C6tpIW3uxJp-vl6rLyfJvoqJRLzF1SuS",
+        },
+        .translate_c = .{
+            .url = "git+https://codeberg.org/ziglang/translate-c?ref=2.0.1#4f5ad374e50d1a98d3da79fa5d3bda9949103bf7",
+            .hash = "translate_c-2.0.1-Q_BUWmpOBwCIhy--up1q6cl3OlIQE86iJU8R-bZ01aPj",
         },
     },
 }

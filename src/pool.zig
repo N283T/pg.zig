@@ -75,7 +75,7 @@ pub const Pool = struct {
                 .off => {},
                 else => |tls_config| {
                     if (opts.connect.host) |h| {
-                        opts_copy.connect._hostz = try aa.dupeZ(u8, h);
+                        opts_copy.connect._hostz = try aa.dupeSentinel(u8, h, 0);
                     }
                     ssl_ctx = try lib.initializeSSLContext(tls_config);
                 },

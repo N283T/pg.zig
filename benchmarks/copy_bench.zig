@@ -52,7 +52,7 @@ pub fn main() !void {
             "{s:<12} {s:<16} {s:>12} {s:>14} {s:>10}\n",
             .{ "size", "strategy", "duration", "rows/sec", "relative" },
         );
-        std.debug.print("{s}\n", .{"-" ** 70});
+        std.debug.print("{s}\n", .{&@as([70]u8, @splat('-'))});
     }
 
     for (SIZES) |n| {
